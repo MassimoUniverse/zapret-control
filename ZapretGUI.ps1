@@ -11,7 +11,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.1'
+$script:AppVersion = '1.1.1'
 
 # ---------- Где мы лежим ----------
 # В собранном .exe $PSScriptRoot / $PSCommandPath / $MyInvocation ПУСТЫЕ (проверено),
@@ -431,11 +431,11 @@ $script:BgOnDone = $null
 $script:BgCancel = $null
 
 $script:BgPrelude = @'
-function BgLog([string]$m)  { $Q.Enqueue(@{ t='log';  msg=$m }) }
-function BgBusy([string]$m) { $Q.Enqueue(@{ t='busy'; msg=$m }) }
-function BgDiag([string]$tag, [string]$text) { $Q.Enqueue(@{ t='diag'; tag=$tag; text=$text }) }
+function BgLog([string]$m)  { $BGQ.Enqueue(@{ t='log';  msg=$m }) }
+function BgBusy([string]$m) { $BGQ.Enqueue(@{ t='busy'; msg=$m }) }
+function BgDiag([string]$tag, [string]$text) { $BGQ.Enqueue(@{ t='diag'; tag=$tag; text=$text }) }
 function BgTest([string]$key, [string]$label, [string]$state, [string]$note) {
-    $Q.Enqueue(@{ t='test'; key=$key; label=$label; state=$state; note=$note })
+    $BGQ.Enqueue(@{ t='test'; key=$key; label=$label; state=$state; note=$note })
 }
 function BgStopped { return [bool]$CANCEL.stop }
 
@@ -550,8 +550,8 @@ function Start-Bg {
     $rs.ApartmentState = 'STA'
     $rs.ThreadOptions  = 'ReuseThread'
     $rs.Open()
-    $rs.SessionStateProxy.SetVariable('P', $Params)
-    $rs.SessionStateProxy.SetVariable('Q', $script:BgQueue)
+    $rs.SessionStateProxy.SetVariable('CTX', $Params)
+    $rs.SessionStateProxy.SetVariable('BGQ', $script:BgQueue)
     $rs.SessionStateProxy.SetVariable('CANCEL', $script:BgCancel)
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
@@ -1616,8 +1616,8 @@ function Invoke-Install([string]$reason) {
     Ensure-UserLists
     Log "Устанавливаю службу ($strat) $reason"
     Start-Bg -BusyText "Устанавливаю службу`n$strat" -Params @{ binPath = $binPath; name = $strat } -Body @'
-$r = Install-ZapretSvc $P.binPath $P.name
-@{ ok = $r.ok; err = $r.err; name = $P.name }
+$r = Install-ZapretSvc $CTX.binPath $CTX.name
+@{ ok = $r.ok; err = $r.err; name = $CTX.name }
 '@ -OnDone {
         param($res)
         $r = @($res)[-1]
@@ -1667,7 +1667,7 @@ $ui.TglService.Add_Click({
     $start = [bool]$ui.TglService.IsChecked
     Start-Bg -BusyText $(if ($start) { 'Запускаю службу...' } else { 'Останавливаю службу...' }) -Params @{ start = $start } -Body @'
 try {
-    if ($P.start) { Start-Service -Name zapret -ErrorAction Stop; BgLog 'Служба запущена' }
+    if ($CTX.start) { Start-Service -Name zapret -ErrorAction Stop; BgLog 'Служба запущена' }
     else {
         Stop-Service -Name zapret -Force -ErrorAction Stop
         Get-Process -Name winws -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -1733,9 +1733,9 @@ $ui.BtnIpsetUpdate.Add_Click({
     } -Body @'
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $res = Invoke-WebRequest -Uri $P.url -TimeoutSec 25 -UseBasicParsing
-    Set-Content -LiteralPath $P.listFile -Value $res.Content -Encoding UTF8
-    $n = (Get-Content -LiteralPath $P.listFile | Measure-Object -Line).Lines
+    $res = Invoke-WebRequest -Uri $CTX.url -TimeoutSec 25 -UseBasicParsing
+    Set-Content -LiteralPath $CTX.listFile -Value $res.Content -Encoding UTF8
+    $n = (Get-Content -LiteralPath $CTX.listFile | Measure-Object -Line).Lines
     BgLog "ipset-all.txt обновлён: $n строк"
     @{ ok = $true; count = $n }
 } catch {
@@ -1800,7 +1800,7 @@ $ui.BtnRunTests.Add_Click({
     Log 'Проверяю доступ к сайтам...'
     Start-Bg -BusyText 'Проверяю доступ к сайтам...' -Cancellable $true -Params @{ targets = $script:TestTargets } -Body @'
 $ok = 0; $total = 0
-foreach ($t in $P.targets) {
+foreach ($t in $CTX.targets) {
     if (BgStopped) { break }
     $total++
     BgTest $t.host $t.label 'run' ''
@@ -1846,10 +1846,10 @@ $ui.BtnAutoPick.Add_Click({
 $results = @()
 $best = $null
 $i = 0
-foreach ($s in $P.strategies) {
+foreach ($s in $CTX.strategies) {
     if (BgStopped) { break }
     $i++
-    BgBusy ("[{0}/{1}] {2}" -f $i, $P.strategies.Count, $s.name)
+    BgBusy ("[{0}/{1}] {2}" -f $i, $CTX.strategies.Count, $s.name)
     BgTest $s.name '' 'run' ''
     $r = Install-ZapretSvc $s.binPath $s.name
     if (-not $r.ok) {
@@ -1859,25 +1859,25 @@ foreach ($s in $P.strategies) {
     }
     Start-Sleep -Seconds 2
     $pass = 0
-    foreach ($t in $P.targets) {
+    foreach ($t in $CTX.targets) {
         if (BgStopped) { break }
-        BgBusy ("[{0}/{1}] {2} — проверяю {3}" -f $i, $P.strategies.Count, $s.name, $t)
+        BgBusy ("[{0}/{1}] {2} — проверяю {3}" -f $i, $CTX.strategies.Count, $s.name, $t)
         if ((Test-TlsDomain $t 6000).ok) { $pass++ }
     }
     if (BgStopped) { break }
     $results += @{ name = $s.name; pass = $pass }
-    BgLog ("  {0}: {1} из {2}" -f $s.name, $pass, $P.targets.Count)
-    if ($pass -eq $P.targets.Count) {
+    BgLog ("  {0}: {1} из {2}" -f $s.name, $pass, $CTX.targets.Count)
+    if ($pass -eq $CTX.targets.Count) {
         BgTest $s.name '' 'ok' ''
         $best = $s
         break
     } else {
-        BgTest $s.name '' 'fail' ("$pass из " + $P.targets.Count)
+        BgTest $s.name '' 'fail' ("$pass из " + $CTX.targets.Count)
     }
 }
 if (-not $best -and $results.Count) {
     $top = $results | Sort-Object { $_.pass } -Descending | Select-Object -First 1
-    if ($top.pass -gt 0) { $best = $P.strategies | Where-Object { $_.name -eq $top.name } | Select-Object -First 1 }
+    if ($top.pass -gt 0) { $best = $CTX.strategies | Where-Object { $_.name -eq $top.name } | Select-Object -First 1 }
 }
 if ($best) {
     BgBusy ("Ставлю выбранную стратегию: " + $best.name)
@@ -1922,8 +1922,8 @@ if ($svc -and $svc.Status -ne 'Running') {
 
 $proxyOn = $false
 try {
-    $p = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
-    if ($p.ProxyEnable -eq 1) { $proxyOn = $true; BgDiag '!' ("Включён системный прокси: " + $p.ProxyServer) }
+    $proxyKey = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+    if ($proxyKey.ProxyEnable -eq 1) { $proxyOn = $true; BgDiag '!' ("Включён системный прокси: " + $proxyKey.ProxyServer) }
 } catch {}
 if (-not $proxyOn) { BgDiag 'OK' 'Системный прокси выключен' }
 
@@ -1966,7 +1966,7 @@ if (Test-Path $hostsFile) {
     else { BgDiag 'OK' 'Файл hosts чистый (нет записей youtube)' }
 }
 
-if (-not (Test-Path (Join-Path $P.root 'bin\WinDivert64.sys'))) { BgDiag 'X' 'Файл bin\WinDivert64.sys не найден — распакуй архив заново' }
+if (-not (Test-Path (Join-Path $CTX.root 'bin\WinDivert64.sys'))) { BgDiag 'X' 'Файл bin\WinDivert64.sys не найден — распакуй архив заново' }
 else { BgDiag 'OK' 'Файлы движка на месте' }
 
 BgDiag '--' 'Диагностика завершена'
@@ -2027,11 +2027,11 @@ $ui.BtnDiscordCache.Add_Click({
         Start-Bg -BusyText 'Чищу кэш Discord...' -Params @{ appdata = $env:APPDATA } -Body @'
 Get-Process -Name Discord -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
-$base = Join-Path $P.appdata 'discord'
+$base = Join-Path $CTX.appdata 'discord'
 foreach ($d in 'Cache','Code Cache','GPUCache') {
-    $p = Join-Path $base $d
-    if (Test-Path $p) {
-        try { [IO.Directory]::Delete($p, $true); BgLog "Удалён: $p" } catch { BgLog "Не удалось удалить: $p" }
+    $dir = Join-Path $base $d
+    if (Test-Path $dir) {
+        try { [IO.Directory]::Delete($dir, $true); BgLog "Удалён: $dir" } catch { BgLog "Не удалось удалить: $dir" }
     }
 }
 BgLog 'Кэш Discord очищен'
@@ -2068,7 +2068,7 @@ $ui.BtnCheckUpd.Add_Click({
     Start-Bg -BusyText 'Проверяю новую версию zapret...' -Params @{ url = $script:VersionUrl } -Body @'
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $v = (Invoke-WebRequest -Uri $P.url -TimeoutSec 20 -UseBasicParsing).Content.Trim()
+    $v = (Invoke-WebRequest -Uri $CTX.url -TimeoutSec 20 -UseBasicParsing).Content.Trim()
     @{ ok = $true; latest = $v }
 } catch {
     @{ ok = $false; err = $_.Exception.Message }
@@ -2133,10 +2133,10 @@ try {
         'lists\list-exclude-user.txt', 'lists\list-general-user.txt', 'lists\ipset-game.txt',
         'lists\ipset-exclude-user.txt', 'utils\faceit.enabled', 'utils\game_filter.enabled', 'utils\check_updates.enabled'
     )
-    foreach ($p in $preserve) {
-        $s = Join-Path $P.root $p
+    foreach ($relPath in $preserve) {
+        $s = Join-Path $CTX.root $relPath
         if (Test-Path -LiteralPath $s) {
-            $d = Join-Path $newRoot $p
+            $d = Join-Path $newRoot $relPath
             $dd = Split-Path $d -Parent
             if (-not (Test-Path $dd)) { New-Item -ItemType Directory -Force -Path $dd | Out-Null }
             Copy-Item -LiteralPath $s -Destination $d -Force
@@ -2154,17 +2154,17 @@ try {
     Start-Sleep -Milliseconds 900
 
     BgBusy 'Делаю резервную копию текущей версии...'
-    $bak = ($P.root.TrimEnd('\')) + '_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
-    robocopy $P.root $bak /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 2>$null | Out-Null
+    $bak = ($CTX.root.TrimEnd('\')) + '_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+    robocopy $CTX.root $bak /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 2>$null | Out-Null
 
     BgBusy 'Копирую новую версию...'
-    robocopy $newRoot $P.root /E /NFL /NDL /NJH /NJS /NP /R:2 /W:1 2>$null | Out-Null
+    robocopy $newRoot $CTX.root /E /NFL /NDL /NJH /NJS /NP /R:2 /W:1 2>$null | Out-Null
     if ($LASTEXITCODE -ge 8) { throw ("Ошибка копирования файлов (robocopy " + $LASTEXITCODE + ")") }
     BgLog ("Резервная копия: " + $bak)
 
-    if ($P.strategy) {
-        BgBusy ('Переустанавливаю службу: ' + $P.strategy)
-        $bat = Join-Path $P.root ($P.strategy + '.bat')
+    if ($CTX.strategy) {
+        BgBusy ('Переустанавливаю службу: ' + $CTX.strategy)
+        $bat = Join-Path $CTX.root ($CTX.strategy + '.bat')
         if (Test-Path -LiteralPath $bat) {
             # строку запуска пересобираем уже из ОБНОВЛЁННОГО .bat
             $lines = Get-Content -LiteralPath $bat
@@ -2181,7 +2181,7 @@ try {
             }
             $marker = 'winws.exe"'
             $argStr = $cmd.Substring($cmd.IndexOf($marker) + $marker.Length).Trim()
-            $gfFile = Join-Path $P.root 'utils\game_filter.enabled'
+            $gfFile = Join-Path $CTX.root 'utils\game_filter.enabled'
             $gTcp = '12'; $gUdp = '12'
             if (Test-Path $gfFile) {
                 $mode = (Get-Content -LiteralPath $gfFile -TotalCount 1)
@@ -2191,9 +2191,9 @@ try {
                 else { $gUdp = '1024-65535' }
             }
             $argStr = $argStr.Replace('%GameFilterTCP%', $gTcp).Replace('%GameFilterUDP%', $gUdp).Replace('%GameFilter%', $gTcp)
-            $argStr = $argStr.Replace('%BIN%', (Join-Path $P.root 'bin\')).Replace('%LISTS%', (Join-Path $P.root 'lists\'))
-            $binPath = ('"{0}" {1}' -f (Join-Path $P.root 'bin\winws.exe'), $argStr)
-            $r = Install-ZapretSvc $binPath $P.strategy
+            $argStr = $argStr.Replace('%BIN%', (Join-Path $CTX.root 'bin\')).Replace('%LISTS%', (Join-Path $CTX.root 'lists\'))
+            $binPath = ('"{0}" {1}' -f (Join-Path $CTX.root 'bin\winws.exe'), $argStr)
+            $r = Install-ZapretSvc $binPath $CTX.strategy
             if (-not $r.ok) { BgLog ('Служба не стартовала: ' + $r.err) }
         }
     }
