@@ -11,7 +11,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.1.1'
+$script:AppVersion = '1.2.0'
 
 # ---------- Где мы лежим ----------
 # В собранном .exe $PSScriptRoot / $PSCommandPath / $MyInvocation ПУСТЫЕ (проверено),
@@ -464,6 +464,41 @@ function Test-TlsDomain([string]$domain, [int]$timeoutMs = 6000) {
         if ($ssl) { try { $ssl.Dispose() } catch {} }
         if ($tcp) { try { $tcp.Close() } catch {} }
     }
+}
+
+# Проверяет сразу несколько доменов параллельно, с общим дедлайном.
+# Возвращает, сколько из них прошли TLS-рукопожатие.
+function Test-TlsMany([string[]]$domains, [int]$timeoutMs = 7000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+    $items = @()
+    foreach ($d in $domains) {
+        $it = @{ domain = $d; tcp = (New-Object System.Net.Sockets.TcpClient); conn = $null; ssl = $null; auth = $null }
+        try { $it.conn = $it.tcp.ConnectAsync($d, 443) } catch {}
+        $items += $it
+    }
+    foreach ($it in $items) {
+        if (-not $it.conn) { continue }
+        $rem = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($rem -gt 0) { try { [void]$it.conn.Wait($rem) } catch {} }
+    }
+    foreach ($it in $items) {
+        if (-not $it.conn -or $it.conn.Status -ne 'RanToCompletion') { continue }
+        try {
+            $it.ssl = New-Object System.Net.Security.SslStream($it.tcp.GetStream(), $false)
+            $it.auth = $it.ssl.AuthenticateAsClientAsync($it.domain, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+        } catch {}
+    }
+    $ok = 0
+    foreach ($it in $items) {
+        if ($it.auth) {
+            $rem = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($rem -gt 0) { try { [void]$it.auth.Wait($rem) } catch {} }
+            if ($it.auth.Status -eq 'RanToCompletion') { $ok++ }
+        }
+        if ($it.ssl) { try { $it.ssl.Dispose() } catch {} }
+        try { $it.tcp.Close() } catch {}
+    }
+    return $ok
 }
 
 function Remove-ZapretSvc {
@@ -1208,7 +1243,7 @@ $xaml = @'
                     <TextBlock Text="А&#x2009;В&#x2009;Т&#x2009;О&#x2009;П&#x2009;О&#x2009;Д&#x2009;Б&#x2009;О&#x2009;Р" Style="{StaticResource Kicker}"/>
                     <TextBlock Text="Найти рабочую стратегию" FontSize="16" FontWeight="SemiBold" Margin="0,8,0,0"/>
                     <TextBlock Style="{StaticResource Muted}" FontSize="12.5" Margin="0,5,0,0"
-                               Text="Перебирает стратегии: ставит каждую и проверяет доступ. Останавливается на первой, где всё работает, и оставляет её. Занимает до нескольких минут, интернет в это время будет прерываться."/>
+                               Text="Проверяет все стратегии по очереди и показывает, какие пробивают блокировки. Какую поставить — выбираешь сам. Текущая стратегия после проверки возвращается. Занимает несколько минут, интернет в это время будет прерываться."/>
                   </StackPanel>
                   <Button x:Name="BtnAutoPick" Content="Подобрать" Style="{StaticResource Accent}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                 </Grid>
@@ -1534,6 +1569,107 @@ function Set-TestRow([string]$key, [string]$label, [string]$state, [string]$note
     }
 }
 
+# ---------- Результаты автоподбора: таблица с выбором ----------
+$script:PickRows = @{}
+
+function Show-PickResults($results, [int]$total) {
+    $ui.TestList.Children.Clear()
+    $script:TestRows = @{}
+    $script:PickRows = @{}
+
+    $sorted = @($results | Sort-Object @{ Expression = { [int]$_.pass }; Descending = $true },
+                                       @{ Expression = { [int]$_.idx };  Descending = $false })
+
+    $hdr = New-Object System.Windows.Controls.TextBlock
+    $hdr.Text = 'Лучшие сверху. Нажми «Поставить» напротив той, что нужна.'
+    $hdr.FontSize = 12.5; $hdr.Foreground = $BrGrayTx
+    $hdr.Margin = New-Object System.Windows.Thickness 12,4,6,8
+    $ui.TestList.Children.Add($hdr) | Out-Null
+
+    $first = $true
+    foreach ($r in $sorted) {
+        $name = [string]$r.name
+        $pass = [int]$r.pass
+        $started = [bool]$r.started
+
+        $row = New-Object System.Windows.Controls.Grid
+        $row.Margin = New-Object System.Windows.Thickness 6,4,6,4
+        $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = 'Auto'
+        $c2 = New-Object System.Windows.Controls.ColumnDefinition
+        $c3 = New-Object System.Windows.Controls.ColumnDefinition; $c3.Width = 'Auto'
+        $c4 = New-Object System.Windows.Controls.ColumnDefinition; $c4.Width = 'Auto'
+        $row.ColumnDefinitions.Add($c1); $row.ColumnDefinitions.Add($c2)
+        $row.ColumnDefinitions.Add($c3); $row.ColumnDefinitions.Add($c4)
+
+        $dot = New-Object System.Windows.Shapes.Ellipse
+        $dot.Width = 7; $dot.Height = 7; $dot.VerticalAlignment = 'Center'
+        $dot.Margin = New-Object System.Windows.Thickness 6,0,0,0
+        [System.Windows.Controls.Grid]::SetColumn($dot, 0)
+
+        $txt = New-Object System.Windows.Controls.TextBlock
+        $txt.Text = $name
+        $txt.FontFamily = New-Object System.Windows.Media.FontFamily 'Consolas'
+        $txt.FontSize = 12.5; $txt.Foreground = $BrBody
+        $txt.VerticalAlignment = 'Center'; $txt.Margin = New-Object System.Windows.Thickness 12,0,10,0
+        $txt.TextTrimming = 'CharacterEllipsis'
+        [System.Windows.Controls.Grid]::SetColumn($txt, 1)
+
+        $st = New-Object System.Windows.Controls.TextBlock
+        $st.FontSize = 12.5; $st.FontWeight = 'Medium'; $st.VerticalAlignment = 'Center'
+        $st.Margin = New-Object System.Windows.Thickness 0,0,6,0
+        [System.Windows.Controls.Grid]::SetColumn($st, 2)
+
+        if (-not $started) {
+            $dot.Fill = $BrRed; $st.Text = 'не запускается'; $st.Foreground = $BrRedTx
+        } elseif ($pass -ge $total -and $total -gt 0) {
+            $dot.Fill = $BrGreen; $dot.Effect = $DotGlow
+            $st.Text = "работает · $pass из $total"; $st.Foreground = $BrGreenTx
+        } elseif ($pass -gt 0) {
+            $dot.Fill = $BrAmber; $st.Text = "частично · $pass из $total"; $st.Foreground = $BrAmber
+        } else {
+            $dot.Fill = $BrRed; $st.Text = "не пробивает · 0 из $total"; $st.Foreground = $BrRedTx
+        }
+
+        $btn = New-Object System.Windows.Controls.Button
+        $btn.Content = 'Поставить'
+        $btn.FontSize = 12
+        $btn.Padding = New-Object System.Windows.Thickness 14,5,14,5
+        $btn.Margin = New-Object System.Windows.Thickness 8,0,4,0
+        $btn.VerticalAlignment = 'Center'
+        $btn.Tag = $name
+        if ($first -and $started -and $pass -ge $total -and $total -gt 0) { $btn.Style = $win.FindResource('Accent') }
+        if (-not $started) { $btn.IsEnabled = $false }
+        $btn.Add_Click({
+            param($sender, $e)
+            $n = [string]$sender.Tag
+            $ui.CmbStrategy.SelectedItem = $n
+            Invoke-Install '(выбрана после автоподбора)'
+        })
+        [System.Windows.Controls.Grid]::SetColumn($btn, 3)
+
+        $row.Children.Add($dot) | Out-Null
+        $row.Children.Add($txt) | Out-Null
+        $row.Children.Add($st)  | Out-Null
+        $row.Children.Add($btn) | Out-Null
+        $ui.TestList.Children.Add($row) | Out-Null
+        $script:PickRows[$name] = @{ btn = $btn; started = $started }
+        $first = $false
+    }
+    Update-PickMarks
+}
+
+# Помечает в таблице подбора стратегию, которая стоит сейчас
+function Update-PickMarks {
+    if (-not $script:PickRows -or $script:PickRows.Count -eq 0) { return }
+    $cur = Get-CurrentStrategy
+    foreach ($k in @($script:PickRows.Keys)) {
+        $pr = $script:PickRows[$k]
+        if (-not $pr.started) { continue }
+        if ($cur -and $k -eq $cur) { $pr.btn.Content = 'Стоит сейчас'; $pr.btn.IsEnabled = $false }
+        else { $pr.btn.Content = 'Поставить'; $pr.btn.IsEnabled = $true }
+    }
+}
+
 # ---------- Status ----------
 $script:updating = $false
 $script:LastTestSummary = 'не запускалась'
@@ -1627,6 +1763,7 @@ $r = Install-ZapretSvc $CTX.binPath $CTX.name
             Log "ОШИБКА установки: $err"
             Show-Info 'Не удалось запустить службу' $err
         }
+        Update-PickMarks
     }
 }
 
@@ -1796,6 +1933,7 @@ $ui.BtnSaveGeneral.Add_Click({
 $ui.BtnRunTests.Add_Click({
     $ui.TestList.Children.Clear()
     $script:TestRows = @{}
+    $script:PickRows = @{}
     foreach ($t in $script:TestTargets) { Set-TestRow $t.host $t.label 'wait' 'в очереди' }
     Log 'Проверяю доступ к сайтам...'
     Start-Bg -BusyText 'Проверяю доступ к сайтам...' -Cancellable $true -Params @{ targets = $script:TestTargets } -Body @'
@@ -1829,23 +1967,31 @@ BgLog ("Проверка: доступно {0} из {1}" -f $ok, $total)
 
 # ---------- Автоподбор стратегии ----------
 $ui.BtnAutoPick.Add_Click({
-    Show-Confirm 'Начать автоподбор?' 'Приложение будет по очереди ставить стратегии и проверять доступ. Это займёт до нескольких минут, интернет в это время будет прерываться. Остановить можно в любой момент.' 'Начать' $false {
+    Show-Confirm 'Начать автоподбор?' 'Приложение проверит все стратегии по очереди и покажет, какие пробивают блокировки. Какую поставить — выберешь сам. Текущая стратегия после проверки вернётся. Займёт несколько минут, интернет в это время будет прерываться. Остановить можно в любой момент.' 'Начать' $false {
         $list = @()
-        $sel = Get-SelectedStrategy
-        $names = @(Get-StrategyFiles | ForEach-Object { $_.BaseName })
-        if ($sel) { $names = @($sel) + @($names | Where-Object { $_ -ne $sel }) }
-        foreach ($n in $names) {
+        foreach ($n in @(Get-StrategyFiles | ForEach-Object { $_.BaseName })) {
             try { $list += @{ name = $n; binPath = (Get-StrategyBinPath $n) } } catch {}
         }
         if (-not $list.Count) { Show-Info 'Нет стратегий' 'В папке не найдено ни одного general-файла.'; return }
 
+        # запоминаем, что стояло до проверки — вернём это в конце
+        $orig = Get-CurrentStrategy
+        $origBin = $null
+        if ($orig) { try { $origBin = Get-StrategyBinPath $orig } catch {} }
+        $hadSvc = [bool](Get-Service -Name zapret -ErrorAction SilentlyContinue)
+
         $ui.TestList.Children.Clear()
         $script:TestRows = @{}
-        Log "Автоподбор: перебираю $($list.Count) стратегий"
-        Start-Bg -BusyText 'Автоподбор стратегии...' -Cancellable $true -Params @{ strategies = $list; targets = $script:PickTargets } -Body @'
+        $script:PickRows = @{}
+        foreach ($s in $list) { Set-TestRow $s.name '' 'wait' 'в очереди' }
+        Log "Автоподбор: проверяю все стратегии ($($list.Count))"
+        Start-Bg -BusyText 'Автоподбор стратегии...' -Cancellable $true -Params @{
+            strategies = $list; targets = $script:PickTargets
+            orig = $orig; origBin = $origBin; hadSvc = $hadSvc
+        } -Body @'
 $results = @()
-$best = $null
 $i = 0
+$total = @($CTX.targets).Count
 foreach ($s in $CTX.strategies) {
     if (BgStopped) { break }
     $i++
@@ -1855,47 +2001,57 @@ foreach ($s in $CTX.strategies) {
     if (-not $r.ok) {
         BgTest $s.name '' 'fail' 'не запускается'
         BgLog ("  {0}: служба не стартовала — {1}" -f $s.name, $r.err)
+        $results += @{ name = $s.name; pass = -1; started = $false; idx = $i }
         continue
     }
     Start-Sleep -Seconds 2
-    $pass = 0
-    foreach ($t in $CTX.targets) {
-        if (BgStopped) { break }
-        BgBusy ("[{0}/{1}] {2} — проверяю {3}" -f $i, $CTX.strategies.Count, $s.name, $t)
-        if ((Test-TlsDomain $t 6000).ok) { $pass++ }
-    }
     if (BgStopped) { break }
-    $results += @{ name = $s.name; pass = $pass }
-    BgLog ("  {0}: {1} из {2}" -f $s.name, $pass, $CTX.targets.Count)
-    if ($pass -eq $CTX.targets.Count) {
-        BgTest $s.name '' 'ok' ''
-        $best = $s
-        break
-    } else {
-        BgTest $s.name '' 'fail' ("$pass из " + $CTX.targets.Count)
-    }
+    $pass = Test-TlsMany $CTX.targets 7000
+    $results += @{ name = $s.name; pass = $pass; started = $true; idx = $i }
+    BgLog ("  {0}: {1} из {2}" -f $s.name, $pass, $total)
+    if ($pass -ge $total) { BgTest $s.name '' 'ok' '' }
+    elseif ($pass -gt 0) { BgTest $s.name '' 'fail' ("частично: $pass из $total") }
+    else { BgTest $s.name '' 'fail' ("0 из $total") }
 }
-if (-not $best -and $results.Count) {
-    $top = $results | Sort-Object { $_.pass } -Descending | Select-Object -First 1
-    if ($top.pass -gt 0) { $best = $CTX.strategies | Where-Object { $_.name -eq $top.name } | Select-Object -First 1 }
-}
-if ($best) {
-    BgBusy ("Ставлю выбранную стратегию: " + $best.name)
-    $r = Install-ZapretSvc $best.binPath $best.name
-    BgLog ("Автоподбор завершён, оставляю: " + $best.name)
-    @{ best = $best.name; results = $results; installed = $r.ok }
+$stopped = BgStopped
+
+# возвращаем систему в состояние до проверки
+if ($CTX.origBin) {
+    BgBusy ("Возвращаю исходную стратегию: " + $CTX.orig)
+    $rr = Install-ZapretSvc $CTX.origBin $CTX.orig
+    if ($rr.ok) { BgLog ("Вернул исходную стратегию: " + $CTX.orig) }
+    else { BgLog ("Не удалось вернуть исходную стратегию: " + $rr.err) }
+} elseif (-not $CTX.hadSvc) {
+    BgBusy 'Снимаю тестовую службу...'
+    Remove-ZapretSvc
+    BgLog 'До проверки служба не стояла — тестовую снял'
 } else {
-    BgLog 'Автоподбор: рабочей стратегии не нашлось'
-    @{ best = $null; results = $results; installed = $false }
+    BgLog 'Не удалось определить исходную стратегию — оставлена последняя проверенная'
 }
+@{ results = $results; total = $total; stopped = $stopped; orig = $CTX.orig }
 '@ -OnDone {
             param($res)
             $r = @($res)[-1]
-            if ($r -and $r.best) {
-                $ui.CmbStrategy.SelectedItem = $r.best
-                Show-Info 'Стратегия подобрана' "Лучший результат у «$($r.best)» — она установлена и запущена с автозапуском."
-            } elseif ($r) {
-                Show-Info 'Не нашлось рабочей стратегии' 'Ни одна стратегия не дала доступа. Проверь вкладку «Диагностика» на конфликты (VPN, другой обход, Adguard) и что интернет вообще работает.'
+            if (-not $r) { return }
+            $rows = @($r.results)
+            if (-not $rows.Count) {
+                $ui.TestList.Children.Clear(); $script:TestRows = @{}; $script:PickRows = @{}
+                $back0 = if ($r.orig) { " Текущая стратегия возвращена: «$($r.orig)»." } else { '' }
+                Show-Info 'Проверка остановлена' ("Ни одна стратегия не успела провериться." + $back0)
+                return
+            }
+            Show-PickResults $rows ([int]$r.total)
+            $full = @($rows | Where-Object { $_.started -and $_.pass -ge $r.total }).Count
+            $part = @($rows | Where-Object { $_.started -and $_.pass -gt 0 -and $_.pass -lt $r.total }).Count
+            $head = if ($r.stopped) { "Проверка остановлена, проверено стратегий: $($rows.Count)." } else { "Проверено стратегий: $($rows.Count)." }
+            $back = if ($r.orig) { " Текущая стратегия возвращена: «$($r.orig)»." } else { '' }
+            Log "Автоподбор завершён: полностью работают $full, частично $part, всего $($rows.Count)"
+            if ($full -gt 0) {
+                Show-Info 'Готово — выбирай' ("$head Полностью работают: $full, частично: $part.$back" + [Environment]::NewLine + [Environment]::NewLine + 'В списке нажми «Поставить» напротив нужной — лучшие сверху.')
+            } elseif ($part -gt 0) {
+                Show-Info 'Полностью рабочих нет' ("$head Частично работают: $part.$back" + [Environment]::NewLine + [Environment]::NewLine + 'Можно поставить лучшую из частичных — они сверху списка.')
+            } else {
+                Show-Info 'Рабочей стратегии не нашлось' ("$head Ни одна не дала доступа.$back" + [Environment]::NewLine + [Environment]::NewLine + 'Проверь вкладку «Диагностика»: мешать может VPN, другой обход или Adguard.')
             }
         }
     } $null
