@@ -11,7 +11,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.3.0'
 
 # ---------- Где мы лежим ----------
 # В собранном .exe $PSScriptRoot / $PSCommandPath / $MyInvocation ПУСТЫЕ (проверено),
@@ -511,6 +511,32 @@ function Remove-ZapretSvc {
             & sc.exe delete $wd 2>&1 | Out-Null
         }
     }
+}
+
+# Строка netsh локализована («RFC 1323 Timestamps» / «Метки времени RFC 1323») — ищем по номеру RFC
+function Get-TcpTimestamps {
+    foreach ($l in @(& netsh interface tcp show global 2>$null)) {
+        if ("$l" -match '1323|timestamps' -and "$l" -match ':\s*(\w+)\s*$') { return $Matches[1].ToLower() }
+    }
+    return ''
+}
+
+# Стандарт Windows — allowed. В справке netsh значение называется default, но allowed тоже описан — пробуем оба
+function Reset-TcpTimestamps {
+    foreach ($v in 'default', 'allowed') {
+        & netsh interface tcp set global timestamps=$v 2>&1 | Out-Null
+        $cur = Get-TcpTimestamps
+        if ($cur -and $cur -ne 'enabled') { return $cur }
+    }
+    return (Get-TcpTimestamps)
+}
+
+function Get-ZapretLeftovers {
+    $left = @()
+    if (Get-Service -Name zapret -ErrorAction SilentlyContinue) { $left += 'служба zapret' }
+    foreach ($wd in 'WinDivert','WinDivert14') { if (Get-Service -Name $wd -ErrorAction SilentlyContinue) { $left += "драйвер $wd" } }
+    if (Get-Process -Name winws -ErrorAction SilentlyContinue) { $left += 'процесс winws.exe' }
+    return ,$left
 }
 
 function Get-SvcFailReason {
@@ -1324,6 +1350,7 @@ $xaml = @'
                 <Button x:Name="BtnFixDivert" Content="Удалить WinDivert" Margin="0,0,10,10" Padding="18,11"/>
                 <Button x:Name="BtnDiscordCache" Content="Очистить кэш Discord" Margin="0,0,10,10" Padding="18,11"/>
                 <Button x:Name="BtnOpenLog" Content="Папка с логом" Margin="0,0,10,10" Padding="18,11"/>
+                <Button x:Name="BtnResetAll" Content="Вернуть всё как было" Style="{StaticResource Danger}" BorderBrush="#40E5534B" Margin="0,0,10,10" Padding="18,11"/>
               </WrapPanel>
               <Border Grid.Row="1" Background="{StaticResource WellBg}" BorderBrush="{StaticResource Line}" BorderThickness="1"
                       CornerRadius="14" Padding="14,12" Margin="0,0,0,16">
@@ -1416,7 +1443,7 @@ foreach ($n in @('TitleBar','BtnMin','BtnClose','TxtRoot','PillService','DotServ
                  'BtnRunTests','TestList','BtnAutoPick',
                  'TxtExclude','BtnSaveExclude','TxtGeneral','BtnSaveGeneral',
                  'TxtVerLocal','TxtVerLatest','BtnCheckUpd','BtnDoUpd','LnkTg',
-                 'BtnDiag','BtnReport','BtnRestartSvc','BtnOpenFolder','BtnKillWinws','BtnFixDivert','BtnDiscordCache','BtnOpenLog','TxtDiag','TxtLog',
+                 'BtnDiag','BtnReport','BtnRestartSvc','BtnOpenFolder','BtnKillWinws','BtnFixDivert','BtnDiscordCache','BtnOpenLog','BtnResetAll','TxtDiag','TxtLog',
                  'DialogOverlay','DlgTitle','DlgMsg','DlgYes','DlgNo',
                  'BusyOverlay','BusyText','BusySub','BtnBusyCancel','MainTabs')) {
     $ui[$n] = $win.FindName($n)
@@ -1828,7 +1855,7 @@ try {
 $ui.BtnInstall.Add_Click({ Invoke-Install '' })
 
 $ui.BtnRemove.Add_Click({
-    Show-Confirm 'Удалить службу Zapret?' 'Служба и правила WinDivert будут удалены из системы, обход перестанет запускаться при старте ПК. Списки доменов сохранятся.' 'Да, удалить' $true {
+    Show-Confirm 'Удалить службу Zapret?' 'Служба и драйвер WinDivert будут удалены из системы, обход перестанет запускаться при старте ПК. Списки и настройки сохранятся — поставить обратно можно в один клик. Полный откат со всеми настройками — вкладка Диагностика → «Вернуть всё как было».' 'Да, удалить' $true {
         Log 'Удаляю службу и WinDivert...'
         Start-Bg -BusyText 'Удаляю службу...' -Body @'
 Remove-ZapretSvc
@@ -2083,9 +2110,10 @@ try {
 } catch {}
 if (-not $proxyOn) { BgDiag 'OK' 'Системный прокси выключен' }
 
-$ts = & netsh interface tcp show global | Select-String -Pattern 'timestamps' -SimpleMatch
-if ($ts -and $ts.ToString() -match '(?i)enabled') { BgDiag 'OK' 'TCP timestamps включены' }
-else { & netsh interface tcp set global timestamps=enabled | Out-Null; BgDiag '!' 'TCP timestamps были выключены — включил' }
+$tsv = Get-TcpTimestamps
+if ($tsv -eq 'enabled') { BgDiag 'OK' 'TCP timestamps включены' }
+elseif (-not $svc) { BgDiag 'OK' ("TCP timestamps: " + $(if ($tsv) { $tsv } else { '?' }) + " (стандарт Windows, включатся при установке службы)") }
+else { & netsh interface tcp set global timestamps=enabled 2>&1 | Out-Null; BgDiag '!' 'TCP timestamps были выключены — включил' }
 
 if (Get-Process -Name AdguardSvc -ErrorAction SilentlyContinue) { BgDiag 'X' 'Найден Adguard — может ломать Discord' }
 else { BgDiag 'OK' 'Adguard не найден' }
@@ -2176,6 +2204,45 @@ foreach ($wd in 'WinDivert','WinDivert14') {
 BgLog 'WinDivert остановлен и удалён'
 @{ ok = $true }
 '@
+})
+
+$ui.BtnResetAll.Add_Click({
+    $msg = "Уберу из системы всё, что добавлял zapret:`n" +
+           "•  службу zapret и автозапуск`n" +
+           "•  драйвер WinDivert и процесс winws.exe`n" +
+           "•  FACEIT MODE и игровой фильтр — выключу`n" +
+           "•  сетевую настройку TCP timestamps — верну стандартную Windows`n`n" +
+           "Обход перестанет работать. Папка zapret и твои списки сайтов останутся — если zapret больше не нужен, после этого просто удали папку."
+    Show-Confirm 'Вернуть всё как было?' $msg 'Да, вернуть' $true {
+        Log 'Откат: удаляю службу и WinDivert, возвращаю настройки Windows...'
+        Start-Bg -BusyText 'Возвращаю всё как было...' -Body @'
+Remove-ZapretSvc
+$left = Get-ZapretLeftovers
+for ($i = 0; $i -lt 10 -and $left.Count; $i++) { Start-Sleep -Milliseconds 500; $left = Get-ZapretLeftovers }
+if ($left.Count) { BgLog ('Не удалось убрать: ' + ($left -join ', ')) } else { BgLog 'Служба zapret и WinDivert удалены, winws.exe остановлен' }
+$ts = Reset-TcpTimestamps
+if ($ts -eq 'enabled') { BgLog 'TCP timestamps остались включены — Windows не дала поменять (это безвредно)' }
+else { BgLog ('TCP timestamps: стандарт Windows (' + $ts + ')') }
+@{ ok = ($left.Count -eq 0); left = ($left -join ', '); ts = $ts }
+'@ -OnDone {
+            param($res)
+            $r = @($res)[-1]
+            try { Set-Faceit $false } catch { Log "ОШИБКА: не удалось выключить FACEIT MODE: $($_.Exception.Message)" }
+            Hide-Warn
+            Update-Status
+            Update-PickMarks
+            if ($r -and $r.ok) {
+                Log 'Откат завершён'
+                $net = if ($r.ts -eq 'enabled') { '. Настройку TCP timestamps Windows поменять не дала — она безвредна, можно не обращать внимания.' } else { ', настройки сети стандартные.' }
+                Show-Info 'Готово — всё как было' ("Службы и драйвера zapret в системе больше нет, FACEIT MODE выключен" + $net + "`n`nЕсли zapret больше не нужен — удали папку с ним. Вернуть обход — вкладка Управление → «Установить службу».")
+            } elseif ($r -and $r.left) {
+                Log "Откат не до конца: осталось $($r.left)"
+                Show-Info 'Почти готово' "Не получилось убрать: $($r.left).`n`nОбычно Windows дочищает это после перезагрузки. Перезагрузи ПК и нажми кнопку ещё раз."
+            } else {
+                Show-Info 'Что-то пошло не так' 'Откат прервался с ошибкой — подробности в журнале внизу окна. Нажми кнопку ещё раз, а если не поможет — перезагрузи ПК и повтори.'
+            }
+        }
+    } $null
 })
 
 $ui.BtnDiscordCache.Add_Click({
