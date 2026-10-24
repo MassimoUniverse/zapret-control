@@ -1,8 +1,12 @@
 ﻿# ============================================================
-#  Zapret Control 1.1 - GUI manager for zapret-discord-youtube
+#  Zapret Control - GUI manager for zapret-discord-youtube
 #  Дизайн: claude.ai/design "Zapret Control дизайн-система"
 #  1.1: фоновые операции (окно не зависает), автоподбор стратегии,
 #       проверка доступа, punycode, лог в файл, один экземпляр
+#  1.2: автоподбор проверяет все стратегии, выбор за пользователем
+#  1.3: кнопка «Вернуть всё как было»
+#  1.4: самообновление приложения, тихая проверка версий при запуске,
+#       подсказки, DNS в диагностике, Esc/Enter в диалогах, память окна
 # ============================================================
 param(
     [switch]$TestParse,
@@ -11,7 +15,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.3.0'
+$script:AppVersion = '1.4.0'
+$script:SelfPath   = $PSCommandPath
+$script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
+$script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
+$script:RestartPath = $null
 
 # ---------- Где мы лежим ----------
 # В собранном .exe $PSScriptRoot / $PSCommandPath / $MyInvocation ПУСТЫЕ (проверено),
@@ -31,7 +39,9 @@ $script:AppDir = Get-AppDir
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and -not $TestParse -and -not $TestUI) {
     if ($PSCommandPath) {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+        # параметры пробрасываем в повышенный экземпляр, иначе -RootOverride терялся
+        $extra = if ($RootOverride) { " -RootOverride `"$RootOverride`"" } else { '' }
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`"$extra"
     } else {
         try { Start-Process ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Verb RunAs } catch {}
     }
@@ -237,6 +247,25 @@ function Init-FileLog {
 }
 function Write-FileLog([string]$msg) {
     try { [IO.File]::AppendAllText($script:LogFile, ('{0}  {1}{2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg, [Environment]::NewLine), [Text.Encoding]::UTF8) } catch {}
+}
+
+# ---------- Настройки приложения (положение окна) ----------
+# лежат в профиле пользователя, а не в папке zapret — переживают обновление и переезд папки
+$script:SettingsFile = Join-Path $env:LOCALAPPDATA 'ZapretControl\settings.json'
+function Get-AppSettings {
+    try {
+        if (Test-Path -LiteralPath $script:SettingsFile) {
+            return (Get-Content -LiteralPath $script:SettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+        }
+    } catch {}
+    return $null
+}
+function Save-AppSettings([hashtable]$s) {
+    try {
+        $dir = Split-Path $script:SettingsFile -Parent
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        [IO.File]::WriteAllText($script:SettingsFile, ($s | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
+    } catch {}
 }
 
 # ---------- Core logic ----------
@@ -624,6 +653,26 @@ function Start-Bg {
     return $true
 }
 
+# Тихая фоновая задача: без оверлея и без блокировки кнопок — для проверки версий.
+# Отдельный слот, чтобы не мешать Start-Bg и не ловить «Дождись окончания операции».
+$script:QPs = $null; $script:QHandle = $null; $script:QOnDone = $null
+function Start-Quiet {
+    param([string]$Body, [hashtable]$Params = @{}, [scriptblock]$OnDone = $null)
+    if ($script:QPs) { return $false }
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('CTX', $Params)
+    $rs.SessionStateProxy.SetVariable('BGQ', $script:BgQueue)
+    $rs.SessionStateProxy.SetVariable('CANCEL', [hashtable]::Synchronized(@{ stop = $false }))
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($script:BgPrelude + "`n" + $Body)
+    $script:QPs = $ps
+    $script:QHandle = $ps.BeginInvoke()
+    $script:QOnDone = $OnDone
+    return $true
+}
+
 # ---------- XAML ----------
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -684,7 +733,29 @@ $xaml = @'
       <Setter Property="Fill" Value="{StaticResource Line}"/>
     </Style>
 
+    <!-- Подсказки в цвет темы: стандартная белая выглядела чужой -->
+    <Style TargetType="ToolTip">
+      <Setter Property="Background" Value="#131B15"/>
+      <Setter Property="Foreground" Value="{StaticResource TextBody}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource LineHover}"/>
+      <Setter Property="FontSize" Value="12.5"/>
+      <Setter Property="Padding" Value="12,8"/>
+      <Setter Property="HasDropShadow" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ToolTip">
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="1" CornerRadius="8" Padding="{TemplateBinding Padding}" MaxWidth="340">
+              <TextBlock Text="{Binding Content, RelativeSource={RelativeSource TemplatedParent}}" TextWrapping="Wrap" Foreground="{TemplateBinding Foreground}"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <Style TargetType="Button">
+      <Setter Property="ToolTipService.ShowDuration" Value="20000"/>
+      <Setter Property="ToolTipService.InitialShowDelay" Value="600"/>
       <Setter Property="Background" Value="#131B15"/>
       <Setter Property="Foreground" Value="{StaticResource TextHi}"/>
       <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
@@ -1114,11 +1185,16 @@ $xaml = @'
               <TextBlock Text="Z&#x2009;A&#x2009;P&#x2009;R&#x2009;E&#x2009;T&#x2009;&#x2009;&#x2009;C&#x2009;O&#x2009;N&#x2009;T&#x2009;R&#x2009;O&#x2009;L"
                          FontSize="13" FontWeight="SemiBold" Margin="13,0,0,0" VerticalAlignment="Center"/>
               <TextBlock FontSize="11.5" Margin="12,1,0,0" VerticalAlignment="Center" Foreground="{StaticResource TextLow}">
-                <Hyperlink x:Name="LnkTg" Foreground="#5FD6A0" TextDecorations="None">by Massimo</Hyperlink>
+                <Hyperlink x:Name="LnkTg" Foreground="#5FD6A0" TextDecorations="None" ToolTip="Канал автора в Telegram">by Massimo</Hyperlink>
+              </TextBlock>
+              <TextBlock x:Name="TxtVer" Text="v—" FontFamily="Consolas" FontSize="11" Margin="12,1,0,0" VerticalAlignment="Center" Foreground="{StaticResource TextLow}"/>
+              <TextBlock FontSize="11" FontFamily="Consolas" Margin="10,1,0,0" VerticalAlignment="Center" Foreground="{StaticResource TextLow}">
+                <Hyperlink x:Name="LnkGh" Foreground="#5A6E60" TextDecorations="None" ToolTip="Исходный код приложения на GitHub">github</Hyperlink>
               </TextBlock>
             </StackPanel>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,14,0">
-              <TextBlock x:Name="TxtRoot" FontFamily="Consolas" FontSize="11" Foreground="{StaticResource TextLow}" VerticalAlignment="Center" Margin="0,0,18,0"/>
+              <TextBlock x:Name="TxtRoot" FontFamily="Consolas" FontSize="11" Foreground="{StaticResource TextLow}" VerticalAlignment="Center" Margin="0,0,18,0"
+                         MaxWidth="380" TextTrimming="CharacterEllipsis" ToolTip="Папка zapret, которой управляет приложение"/>
               <Button x:Name="BtnMin" Style="{StaticResource WinBtn}" Content="&#xE921;"/>
               <Button x:Name="BtnClose" Style="{StaticResource WinBtnClose}" Content="&#xE8BB;" Margin="6,0,0,0"/>
             </StackPanel>
@@ -1145,7 +1221,8 @@ $xaml = @'
                           </StackPanel>
                         </Border>
                       </StackPanel>
-                      <ToggleButton x:Name="TglService" Style="{StaticResource SwitchLg}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                      <ToggleButton x:Name="TglService" Style="{StaticResource SwitchLg}" HorizontalAlignment="Right" VerticalAlignment="Center"
+                                    ToolTip="Запустить или остановить обход прямо сейчас. Автозапуск при включении ПК при этом не меняется."/>
                     </Grid>
                     <TextBlock x:Name="TxtStrategy" Style="{StaticResource Muted}" FontSize="13" Margin="0,10,0,0"/>
                     <Rectangle Style="{StaticResource Hair}" Margin="0,18,0,18"/>
@@ -1155,9 +1232,12 @@ $xaml = @'
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                       </Grid.ColumnDefinitions>
-                      <ComboBox x:Name="CmbStrategy" Grid.Column="0" HorizontalAlignment="Stretch"/>
-                      <Button x:Name="BtnInstall" Grid.Column="1" Content="Установить службу" Style="{StaticResource Accent}" Margin="10,0,0,0"/>
-                      <Button x:Name="BtnRemove" Grid.Column="2" Content="Удалить" Style="{StaticResource Danger}" Margin="4,0,0,0"/>
+                      <ComboBox x:Name="CmbStrategy" Grid.Column="0" HorizontalAlignment="Stretch"
+                                ToolTip="Стратегия — набор приёмов, которыми zapret обманывает DPI провайдера. У разных провайдеров работают разные. Не угадал — вкладка Проверка → «Подобрать»."/>
+                      <Button x:Name="BtnInstall" Grid.Column="1" Content="Установить службу" Style="{StaticResource Accent}" Margin="10,0,0,0"
+                              ToolTip="Создаст службу Windows с выбранной стратегией и включит автозапуск. Если служба уже есть — пересоздаст её с новой стратегией."/>
+                      <Button x:Name="BtnRemove" Grid.Column="2" Content="Удалить" Style="{StaticResource Danger}" Margin="4,0,0,0"
+                              ToolTip="Удалит службу и драйвер WinDivert. Списки и настройки останутся — поставить обратно можно в один клик."/>
                     </Grid>
                     <TextBlock x:Name="TxtWarn" Text="Настройки изменены — переустанови службу, чтобы применить"
                                Foreground="{StaticResource Amber}" FontSize="12.5" Margin="0,12,0,0" Visibility="Collapsed"/>
@@ -1178,7 +1258,8 @@ $xaml = @'
                       <TextBlock Style="{StaticResource Muted}" FontSize="13" Margin="0,6,0,0"
                                  Text="Игровой обход на все IP (порты 1024–65535) — нужен для FACEIT и CS2. Не задевает браузер и OBS. Выключай, когда не играешь."/>
                     </StackPanel>
-                    <ToggleButton x:Name="TglFaceit" Style="{StaticResource SwitchLg}" HorizontalAlignment="Right" VerticalAlignment="Top"/>
+                    <ToggleButton x:Name="TglFaceit" Style="{StaticResource SwitchLg}" HorizontalAlignment="Right" VerticalAlignment="Top"
+                                  ToolTip="Включает обход на любые IP по портам 1024–65535 — так ловится игровой трафик, у которого нет домена. Game Filter при этом переключается в «TCP и UDP»."/>
                   </Grid>
                 </Border>
 
@@ -1188,9 +1269,10 @@ $xaml = @'
                     <Grid Margin="0,14,0,14">
                       <StackPanel VerticalAlignment="Center">
                         <TextBlock Text="Game Filter" FontSize="14.5" FontWeight="Medium"/>
-                        <TextBlock Text="Диапазоны портов для игрового трафика" Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,3,0,0"/>
+                        <TextBlock x:Name="TxtGameSub" Text="Диапазоны портов для игрового трафика" Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,3,0,0"/>
                       </StackPanel>
-                      <ComboBox x:Name="CmbGame" Width="190" Height="38" HorizontalAlignment="Right">
+                      <ComboBox x:Name="CmbGame" Width="190" Height="38" HorizontalAlignment="Right"
+                                ToolTip="На каких портах применять игровые правила обхода. Пока включён FACEIT MODE, управляется им.">
                         <ComboBoxItem Content="Выключен"/>
                         <ComboBoxItem Content="TCP и UDP"/>
                         <ComboBoxItem Content="Только TCP"/>
@@ -1203,33 +1285,48 @@ $xaml = @'
                         <TextBlock Text="IPSet список" FontSize="14.5" FontWeight="Medium"/>
                         <TextBlock x:Name="TxtIpset" Text="" Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,3,0,0"/>
                       </StackPanel>
-                      <Button x:Name="BtnIpsetUpdate" Content="Обновить список" HorizontalAlignment="Right" Padding="15,9"/>
+                      <Button x:Name="BtnIpsetUpdate" Content="Обновить список" HorizontalAlignment="Right" Padding="15,9"
+                              ToolTip="Скачает свежий список IP-адресов Discord и YouTube с GitHub. Нужен редко — когда голос в Discord перестал работать."/>
                     </Grid>
                     <Rectangle Style="{StaticResource Hair}"/>
                     <Grid Margin="0,14,0,0">
                       <StackPanel VerticalAlignment="Center">
                         <TextBlock Text="Автопроверка обновлений" FontSize="14.5" FontWeight="Medium"/>
-                        <TextBlock Text="Проверять новые версии zapret при запуске" Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,3,0,0"/>
+                        <TextBlock Text="При запуске тихо проверять новые версии zapret и самого приложения" Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,3,0,0"/>
                       </StackPanel>
                       <ToggleButton x:Name="TglUpd" Style="{StaticResource Switch}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                     </Grid>
                   </StackPanel>
                 </Border>
 
-                <!-- Обновление самого zapret -->
+                <!-- Обновление: zapret и само приложение -->
                 <Border Style="{StaticResource Card}">
-                  <Grid>
-                    <StackPanel MaxWidth="560" HorizontalAlignment="Left">
-                      <TextBlock Text="О&#x2009;Б&#x2009;Н&#x2009;О&#x2009;В&#x2009;Л&#x2009;Е&#x2009;Н&#x2009;И&#x2009;Е" Style="{StaticResource Kicker}"/>
-                      <TextBlock x:Name="TxtVerLocal" Text="Установлено: —" FontSize="14.5" FontWeight="Medium" Margin="0,10,0,0"/>
-                      <TextBlock x:Name="TxtVerLatest" Text="Нажми «Проверить», чтобы узнать о новой версии"
-                                 Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,4,0,0" TextWrapping="Wrap"/>
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
-                      <Button x:Name="BtnCheckUpd" Content="Проверить" Padding="15,9"/>
-                      <Button x:Name="BtnDoUpd" Content="Обновить" Style="{StaticResource Accent}" Margin="8,0,0,0" Visibility="Collapsed"/>
-                    </StackPanel>
-                  </Grid>
+                  <StackPanel>
+                    <TextBlock Text="О&#x2009;Б&#x2009;Н&#x2009;О&#x2009;В&#x2009;Л&#x2009;Е&#x2009;Н&#x2009;И&#x2009;Е" Style="{StaticResource Kicker}"/>
+                    <Grid Margin="0,10,0,0">
+                      <StackPanel MaxWidth="560" HorizontalAlignment="Left">
+                        <TextBlock x:Name="TxtVerLocal" Text="zapret: —" FontSize="14.5" FontWeight="Medium"/>
+                        <TextBlock x:Name="TxtVerLatest" Text="Нажми «Проверить», чтобы узнать о новой версии"
+                                   Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                      </StackPanel>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                        <Button x:Name="BtnCheckUpd" Content="Проверить" Padding="15,9"
+                                ToolTip="Спросит у GitHub, есть ли новые версии zapret и Zapret Control. Ничего не скачивает и не меняет."/>
+                        <Button x:Name="BtnDoUpd" Content="Обновить zapret" Style="{StaticResource Accent}" Margin="8,0,0,0" Visibility="Collapsed"
+                                ToolTip="Скачает новую версию zapret, перенесёт твои списки и настройки и переустановит службу. Старая версия сохранится рядом."/>
+                      </StackPanel>
+                    </Grid>
+                    <Rectangle Style="{StaticResource Hair}" Margin="0,14,0,14"/>
+                    <Grid>
+                      <StackPanel MaxWidth="560" HorizontalAlignment="Left">
+                        <TextBlock x:Name="TxtAppVer" Text="Zapret Control: —" FontSize="14.5" FontWeight="Medium"/>
+                        <TextBlock x:Name="TxtAppLatest" Text="Само приложение тоже умеет обновляться"
+                                   Foreground="{StaticResource TextMid}" FontSize="12.5" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                      </StackPanel>
+                      <Button x:Name="BtnAppUpd" Content="Обновить приложение" Style="{StaticResource Accent}" HorizontalAlignment="Right" VerticalAlignment="Center" Visibility="Collapsed"
+                              ToolTip="Скачает новую версию Zapret Control с GitHub и заменит файл приложения. Папку zapret и службу не трогает."/>
+                    </Grid>
+                  </StackPanel>
                 </Border>
 
               </StackPanel>
@@ -1252,7 +1349,8 @@ $xaml = @'
                     <TextBlock Style="{StaticResource Muted}" FontSize="13" Margin="0,6,0,0"
                                Text="Приложение само стучится к каждому сайту по TLS и смотрит, отвечает ли он. Зелёный — обход работает, красный — сайт не открывается."/>
                   </StackPanel>
-                  <Button x:Name="BtnRunTests" Content="Проверить сейчас" Style="{StaticResource Accent}" HorizontalAlignment="Right" VerticalAlignment="Top"/>
+                  <Button x:Name="BtnRunTests" Content="Проверить сейчас" Style="{StaticResource Accent}" HorizontalAlignment="Right" VerticalAlignment="Top"
+                          ToolTip="Попробует установить защищённое соединение с YouTube и Discord. Занимает несколько секунд, ничего не меняет."/>
                 </Grid>
               </Border>
 
@@ -1271,7 +1369,8 @@ $xaml = @'
                     <TextBlock Style="{StaticResource Muted}" FontSize="12.5" Margin="0,5,0,0"
                                Text="Проверяет все стратегии по очереди и показывает, какие пробивают блокировки. Какую поставить — выбираешь сам. Текущая стратегия после проверки возвращается. Занимает несколько минут, интернет в это время будет прерываться."/>
                   </StackPanel>
-                  <Button x:Name="BtnAutoPick" Content="Подобрать" Style="{StaticResource Accent}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                  <Button x:Name="BtnAutoPick" Content="Подобрать" Style="{StaticResource Accent}" HorizontalAlignment="Right" VerticalAlignment="Center"
+                          ToolTip="По очереди поставит каждую стратегию и проверит доступ. В конце — таблица, выбираешь сам. Текущая стратегия вернётся."/>
                 </Grid>
               </Border>
             </Grid>
@@ -1342,15 +1441,24 @@ $xaml = @'
                 <RowDefinition Height="*"/>
               </Grid.RowDefinitions>
               <WrapPanel Grid.Row="0" Margin="0,0,0,6">
-                <Button x:Name="BtnDiag" Content="Запустить диагностику" Style="{StaticResource Accent}" Margin="0,0,10,10" Padding="20,11"/>
-                <Button x:Name="BtnReport" Content="Скопировать отчёт" Margin="0,0,10,10" Padding="18,11"/>
-                <Button x:Name="BtnRestartSvc" Content="Перезапустить службу" Margin="0,0,10,10" Padding="18,11"/>
-                <Button x:Name="BtnOpenFolder" Content="Открыть папку" Margin="0,0,10,10" Padding="18,11"/>
-                <Button x:Name="BtnKillWinws" Content="Остановить winws.exe" Margin="0,0,10,10" Padding="18,11"/>
-                <Button x:Name="BtnFixDivert" Content="Удалить WinDivert" Margin="0,0,10,10" Padding="18,11"/>
-                <Button x:Name="BtnDiscordCache" Content="Очистить кэш Discord" Margin="0,0,10,10" Padding="18,11"/>
-                <Button x:Name="BtnOpenLog" Content="Папка с логом" Margin="0,0,10,10" Padding="18,11"/>
-                <Button x:Name="BtnResetAll" Content="Вернуть всё как было" Style="{StaticResource Danger}" BorderBrush="#40E5534B" Margin="0,0,10,10" Padding="18,11"/>
+                <Button x:Name="BtnDiag" Content="Запустить диагностику" Style="{StaticResource Accent}" Margin="0,0,10,10" Padding="20,11"
+                        ToolTip="Проверит службы, драйвер, DNS, прокси и известные конфликты. Ничего не меняет, кроме TCP timestamps, если они оказались выключены."/>
+                <Button x:Name="BtnReport" Content="Скопировать отчёт" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Скопирует состояние, результат диагностики и журнал в буфер обмена — чтобы вставить в сообщение, когда просишь помощи."/>
+                <Button x:Name="BtnRestartSvc" Content="Перезапустить службу" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Остановит и заново запустит службу zapret. Помогает, если обход перестал работать после сна ПК или смены сети."/>
+                <Button x:Name="BtnOpenFolder" Content="Открыть папку" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Откроет папку zapret в Проводнике."/>
+                <Button x:Name="BtnKillWinws" Content="Остановить winws.exe" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Принудительно завершит процесс обхода. Служба поднимет его заново при следующем запуске."/>
+                <Button x:Name="BtnFixDivert" Content="Удалить WinDivert" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Удалит драйвер WinDivert из системы. Нужно, если он завис после сбоя zapret. Служба поставит его заново сама."/>
+                <Button x:Name="BtnDiscordCache" Content="Очистить кэш Discord" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Закроет Discord и удалит его кэш. Помогает, когда после смены стратегии не грузятся картинки или не подключается голос."/>
+                <Button x:Name="BtnOpenLog" Content="Папка с логом" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Откроет папку с журналом приложения."/>
+                <Button x:Name="BtnResetAll" Content="Вернуть всё как было" Style="{StaticResource Danger}" BorderBrush="#40E5534B" Margin="0,0,10,10" Padding="18,11"
+                        ToolTip="Полный откат: удалит службу и драйвер, выключит FACEIT MODE, вернёт сетевую настройку Windows. Папка zapret останется."/>
               </WrapPanel>
               <Border Grid.Row="1" Background="{StaticResource WellBg}" BorderBrush="{StaticResource Line}" BorderThickness="1"
                       CornerRadius="14" Padding="14,12" Margin="0,0,0,16">
@@ -1442,7 +1550,8 @@ foreach ($n in @('TitleBar','BtnMin','BtnClose','TxtRoot','PillService','DotServ
                  'DotWinws','TxtWinws','DotDivert','TxtDivert','TglFaceit','CmbGame','TxtIpset','BtnIpsetUpdate','TglUpd',
                  'BtnRunTests','TestList','BtnAutoPick',
                  'TxtExclude','BtnSaveExclude','TxtGeneral','BtnSaveGeneral',
-                 'TxtVerLocal','TxtVerLatest','BtnCheckUpd','BtnDoUpd','LnkTg',
+                 'TxtVerLocal','TxtVerLatest','BtnCheckUpd','BtnDoUpd','LnkTg','LnkGh','TxtVer','TxtGameSub',
+                 'TxtAppVer','TxtAppLatest','BtnAppUpd',
                  'BtnDiag','BtnReport','BtnRestartSvc','BtnOpenFolder','BtnKillWinws','BtnFixDivert','BtnDiscordCache','BtnOpenLog','BtnResetAll','TxtDiag','TxtLog',
                  'DialogOverlay','DlgTitle','DlgMsg','DlgYes','DlgNo',
                  'BusyOverlay','BusyText','BusySub','BtnBusyCancel','MainTabs')) {
@@ -1728,8 +1837,15 @@ function Update-Status {
             $r1 = New-Object System.Windows.Documents.Run 'Стратегия: '
             $r2 = New-Object System.Windows.Documents.Run $strat
             $r2.Foreground = $BrBody
-            $r3 = New-Object System.Windows.Documents.Run ' · автозапуск при включении ПК'
-            $ui.TxtStrategy.Inlines.Add($r1); $ui.TxtStrategy.Inlines.Add($r2); $ui.TxtStrategy.Inlines.Add($r3)
+            $ui.TxtStrategy.Inlines.Add($r1); $ui.TxtStrategy.Inlines.Add($r2)
+            if (Test-Path -LiteralPath (Join-Path $script:Root ($strat + '.bat'))) {
+                $ui.TxtStrategy.Inlines.Add((New-Object System.Windows.Documents.Run ' · автозапуск при включении ПК'))
+            } else {
+                # после обновления zapret стратегию могли переименовать — служба работает, но пересобрать её уже нельзя
+                $r3 = New-Object System.Windows.Documents.Run ' · файла этой стратегии больше нет — выбери другую и переустанови'
+                $r3.Foreground = $BrAmber
+                $ui.TxtStrategy.Inlines.Add($r3)
+            }
         } else {
             $ui.TxtStrategy.Inlines.Add((New-Object System.Windows.Documents.Run 'Стратегия не выбрана — установи службу'))
         }
@@ -1745,7 +1861,11 @@ function Update-Status {
         elseif ($wd)                           { $ui.DotDivert.Fill = $BrAmber; $ui.TxtDivert.Text = "WinDivert: $($wd.Status)" }
         else                                   { $ui.DotDivert.Fill = $BrGray;  $ui.TxtDivert.Text = 'WinDivert не активен' }
 
-        $ui.TglFaceit.IsChecked = (Test-Faceit)
+        $faceit = Test-Faceit
+        $ui.TglFaceit.IsChecked = $faceit
+        # FACEIT MODE сам выставляет game filter = all; ручная смена в этот момент только ломала режим
+        $ui.CmbGame.IsEnabled = -not $faceit
+        $ui.TxtGameSub.Text = if ($faceit) { 'Управляется FACEIT MODE — выключи его, чтобы менять вручную' } else { 'Диапазоны портов для игрового трафика' }
 
         if (-not $ui.CmbGame.IsDropDownOpen) {
             $mode = (Get-GameFilter).Mode
@@ -1768,6 +1888,18 @@ function Update-Status {
 function Get-SelectedStrategy {
     if ($ui.CmbStrategy.SelectedItem) { return [string]$ui.CmbStrategy.SelectedItem }
     return $null
+}
+
+# Перечитывает список стратегий из папки (после обновления zapret они могут измениться)
+function Refresh-Strategies {
+    $sel = Get-SelectedStrategy
+    $ui.CmbStrategy.Items.Clear()
+    $script:Strategies = @(Get-StrategyFiles | ForEach-Object { $_.BaseName })
+    foreach ($s in $script:Strategies) { [void]$ui.CmbStrategy.Items.Add($s) }
+    $cur = Get-CurrentStrategy
+    if ($sel -and $script:Strategies -contains $sel)     { $ui.CmbStrategy.SelectedItem = $sel }
+    elseif ($cur -and $script:Strategies -contains $cur) { $ui.CmbStrategy.SelectedItem = $cur }
+    elseif ($script:Strategies.Count)                    { $ui.CmbStrategy.SelectedIndex = 0 }
 }
 
 # ---------- Actions (все долгие — в фоне) ----------
@@ -1804,16 +1936,41 @@ function Offer-Reinstall([string]$what) {
 # ---------- Wiring ----------
 Init-FileLog
 $ui.TxtRoot.Text = $script:Root
+$ui.TxtVer.Text = "v$script:AppVersion"
+$ui.TxtAppVer.Text = "Zapret Control: $script:AppVersion"
 
 $ui.TitleBar.Add_MouseLeftButtonDown({ try { $win.DragMove() } catch {} })
 $ui.BtnMin.Add_Click({ $win.WindowState = 'Minimized' })
 $ui.BtnClose.Add_Click({ $win.Close() })
 
-$strategies = @(Get-StrategyFiles | ForEach-Object { $_.BaseName })
-foreach ($s in $strategies) { [void]$ui.CmbStrategy.Items.Add($s) }
-$cur = Get-CurrentStrategy
-if ($cur -and $strategies -contains $cur) { $ui.CmbStrategy.SelectedItem = $cur }
-elseif ($strategies.Count) { $ui.CmbStrategy.SelectedIndex = 0 }
+# Ошибка внутри обработчика кнопки раньше молча убивала всё окно — теперь пишем в журнал и живём дальше
+$win.Dispatcher.Add_UnhandledException({
+    param($sender, $e)
+    $e.Handled = $true
+    $m = try { $e.Exception.GetBaseException().Message } catch { 'неизвестная ошибка' }
+    try { Log "ОШИБКА: $m" } catch {}
+    try { Hide-Busy } catch {}
+    try { Show-Info 'Что-то пошло не так' "$m`n`nПриложение продолжает работать. Если повторится — «Скопировать отчёт» на вкладке Диагностика и напиши в комментарии к посту." } catch {}
+})
+
+# Esc закрывает диалог / останавливает долгую операцию, Enter подтверждает безопасные вопросы
+$win.Add_PreviewKeyDown({
+    param($sender, $e)
+    if ($ui.DialogOverlay.Visibility -eq 'Visible') {
+        if ($e.Key -eq 'Escape') {
+            $ui.DlgNo.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))); $e.Handled = $true
+        } elseif ($e.Key -eq 'Return') {
+            # для опасных подтверждений (красная кнопка) Enter ничего не делает — только осознанный клик
+            if ($ui.DlgYes.Visibility -ne 'Visible') { $ui.DlgNo.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))); $e.Handled = $true }
+            elseif ($ui.DlgYes.Style -ne $win.FindResource('DangerSolid')) { $ui.DlgYes.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))); $e.Handled = $true }
+        }
+    } elseif ($ui.BusyOverlay.Visibility -eq 'Visible' -and $e.Key -eq 'Escape' -and $ui.BtnBusyCancel.Visibility -eq 'Visible') {
+        $ui.BtnBusyCancel.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))); $e.Handled = $true
+    }
+})
+
+$script:Strategies = @()
+Refresh-Strategies
 
 $ExcludePath = Join-Path $script:Lists 'list-exclude-user.txt'
 $GeneralPath = Join-Path $script:Lists 'list-general-user.txt'
@@ -1957,7 +2114,7 @@ $ui.BtnSaveGeneral.Add_Click({
 })
 
 # ---------- Проверка доступа ----------
-$ui.BtnRunTests.Add_Click({
+function Start-AccessTests {
     $ui.TestList.Children.Clear()
     $script:TestRows = @{}
     $script:PickRows = @{}
@@ -1990,6 +2147,15 @@ BgLog ("Проверка: доступно {0} из {1}" -f $ok, $total)
             }
         }
     }
+}
+
+$ui.BtnRunTests.Add_Click({
+    # без запущенного обхода проверка покажет голую блокировку — предупреждаем, чтобы не пугать
+    if (-not (Get-Process -Name winws -ErrorAction SilentlyContinue)) {
+        Show-Confirm 'Обход сейчас не запущен' 'Проверка покажет, что открывается без обхода — скорее всего, ничего. Запусти службу на вкладке «Управление» или проверь как есть.' 'Проверить как есть' $false { Start-AccessTests } $null
+        return
+    }
+    Start-AccessTests
 })
 
 # ---------- Автоподбор стратегии ----------
@@ -2087,8 +2253,12 @@ if ($CTX.origBin) {
 # ---------- Диагностика ----------
 $ui.BtnDiag.Add_Click({
     $ui.TxtDiag.Document.Blocks.Clear()
-    Start-Bg -BusyText 'Проверяю систему...' -Params @{ root = $script:Root } -Body @'
+    Start-Bg -BusyText 'Проверяю систему...' -Params @{ root = $script:Root; strategy = (Get-CurrentStrategy); ver = (Get-LocalVersion); app = $script:AppVersion } -Body @'
 $allSvc = Get-Service -ErrorAction SilentlyContinue
+$svc = Get-Service -Name zapret -ErrorAction SilentlyContinue
+
+BgDiag '--' ("Zapret Control {0} · zapret {1} · служба: {2} · стратегия: {3}" -f $CTX.app, $CTX.ver,
+    $(if ($svc) { [string]$svc.Status } else { 'не установлена' }), $(if ($CTX.strategy) { $CTX.strategy } else { '—' }))
 
 $bfe = Get-Service -Name BFE -ErrorAction SilentlyContinue
 if ($bfe -and $bfe.Status -eq 'Running') { BgDiag 'OK' 'Base Filtering Engine работает' }
@@ -2097,11 +2267,22 @@ else { BgDiag 'X' 'Base Filtering Engine НЕ работает — без нег
 if (Get-Process -Name winws -ErrorAction SilentlyContinue) { BgDiag 'OK' 'winws.exe запущен' }
 else { BgDiag '!' 'winws.exe не запущен (обход не активен)' }
 
-$svc = Get-Service -Name zapret -ErrorAction SilentlyContinue
 if ($svc -and $svc.Status -ne 'Running') {
     $reason = Get-SvcFailReason
     if ($reason) { BgDiag 'X' ("Служба не работает. Журнал Windows: " + $reason) }
 }
+
+# DNS: провайдер может отдавать заглушку вместо реального адреса — обход тут бессилен, нужен DoH
+try {
+    $ips = @([System.Net.Dns]::GetHostAddresses('www.youtube.com') | ForEach-Object { $_.IPAddressToString })
+    $bad = @($ips | Where-Object { $_ -match '^(127\.|0\.0\.0\.0$|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$)' })
+    if (-not $ips.Count) { BgDiag 'X' 'DNS не отвечает — youtube.com не находится. Проверь интернет или смени DNS на 1.1.1.1 / 8.8.8.8' }
+    elseif ($bad.Count) { BgDiag 'X' ('DNS подменяет адреса (youtube.com -> ' + ($bad -join ', ') + ') — включи DNS-over-HTTPS в браузере или в настройках Windows') }
+    else { BgDiag 'OK' ('DNS отвечает: youtube.com -> ' + (@($ips | Select-Object -First 2) -join ', ')) }
+} catch { BgDiag 'X' ('DNS не отвечает: ' + $_.Exception.GetBaseException().Message + ' — смени DNS на 1.1.1.1 / 8.8.8.8') }
+
+if ($CTX.root -match '[^\x00-\x7F]') { BgDiag '!' 'В пути к папке zapret есть кириллица или другие не-латинские символы — у части пользователей из-за этого не стартует служба. Если будут проблемы, перенеси папку в путь из латиницы' }
+else { BgDiag 'OK' 'Путь к папке zapret без кириллицы' }
 
 $proxyOn = $false
 try {
@@ -2270,6 +2451,7 @@ $ui.BtnOpenLog.Add_Click({
 
 $ui.BtnOpenFolder.Add_Click({ try { Start-Process explorer.exe $script:Root } catch {} })
 $ui.LnkTg.Add_Click({ try { Start-Process 'https://t.me/masiuniv' } catch {} })
+$ui.LnkGh.Add_Click({ try { Start-Process $script:AppRepoUrl } catch {} })
 
 $ui.BtnRestartSvc.Add_Click({
     if (-not (Get-Service -Name zapret -ErrorAction SilentlyContinue)) {
@@ -2283,39 +2465,143 @@ BgLog 'Служба перезапущена'
 '@
 })
 
-# ---------- Обновление самого zapret ----------
-$ui.BtnCheckUpd.Add_Click({
-    $ui.TxtVerLocal.Text = "Установлено: $(Get-LocalVersion)"
-    $ui.TxtVerLatest.Text = 'Проверяю...'
-    $ui.TxtVerLatest.Foreground = $BrGrayTx
-    Start-Bg -BusyText 'Проверяю новую версию zapret...' -Params @{ url = $script:VersionUrl } -Body @'
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $v = (Invoke-WebRequest -Uri $CTX.url -TimeoutSec 20 -UseBasicParsing).Content.Trim()
-    @{ ok = $true; latest = $v }
-} catch {
-    @{ ok = $false; err = $_.Exception.Message }
+# ---------- Обновление: zapret и само приложение ----------
+$script:AppUpdate = $null   # @{ ver; url; page } когда на GitHub есть версия новее нашей
+
+function ConvertTo-AppVersion([string]$tag) {
+    try { return [version](($tag -replace '^[vV]', '').Trim()) } catch { return $null }
 }
+
+# Один тихий запрос за обеими версиями; $quiet = запуск по таймеру при старте (без шума в журнале)
+function Start-UpdateCheck([bool]$quiet) {
+    $ui.TxtVerLocal.Text = "zapret: $(Get-LocalVersion)"
+    if (-not $quiet) {
+        $ui.TxtVerLatest.Text = 'Проверяю...';  $ui.TxtVerLatest.Foreground = $BrGrayTx
+        $ui.TxtAppLatest.Text = 'Проверяю...';  $ui.TxtAppLatest.Foreground = $BrGrayTx
+    }
+    $ui.BtnCheckUpd.IsEnabled = $false
+    $started = Start-Quiet -Params @{ verUrl = $script:VersionUrl; appApi = $script:AppRepoApi; quiet = $quiet } -Body @'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$out = @{ quiet = $CTX.quiet }
+try { $out.zapret = (Invoke-WebRequest -Uri $CTX.verUrl -TimeoutSec 15 -UseBasicParsing).Content.Trim() }
+catch { $out.zapretErr = $_.Exception.Message }
+try {
+    $r = Invoke-RestMethod -Uri $CTX.appApi -TimeoutSec 15 -Headers @{ 'User-Agent' = 'zapret-control' }
+    $asset = $r.assets | Where-Object { $_.name -eq 'Zapret-Control.zip' } | Select-Object -First 1
+    $out.appTag  = [string]$r.tag_name
+    $out.appUrl  = if ($asset) { [string]$asset.browser_download_url } else { '' }
+    $out.appPage = [string]$r.html_url
+} catch { $out.appErr = $_.Exception.Message }
+$out
 '@ -OnDone {
         param($res)
         $r = @($res)[-1]
+        $ui.BtnCheckUpd.IsEnabled = $true
+        if (-not $r) { return }
+        $quiet = [bool]$r.quiet
         $local = Get-LocalVersion
-        if ($r -and $r.ok) {
-            if ($r.latest -and $r.latest -ne $local) {
-                $ui.TxtVerLatest.Text = "Доступна новая версия: $($r.latest)"
+        $ui.TxtVerLocal.Text = "zapret: $local"
+        if ($r.zapret) {
+            if ($r.zapret -ne $local) {
+                $ui.TxtVerLatest.Text = "Доступна новая версия zapret: $($r.zapret)"
                 $ui.TxtVerLatest.Foreground = $BrAmber
                 $ui.BtnDoUpd.Visibility = 'Visible'
-                Log "Доступно обновление zapret: $local -> $($r.latest)"
+                Log "Доступно обновление zapret: $local -> $($r.zapret)"
             } else {
-                $ui.TxtVerLatest.Text = "Установлена последняя версия ($local)"
+                $ui.TxtVerLatest.Text = "Последняя версия ($local)"
                 $ui.TxtVerLatest.Foreground = $BrGreenTx
                 $ui.BtnDoUpd.Visibility = 'Collapsed'
             }
-        } else {
+        } elseif (-not $quiet) {
             $ui.TxtVerLatest.Text = 'Не удалось проверить (нет связи с GitHub?)'
             $ui.TxtVerLatest.Foreground = $BrRedTx
         }
+        $nv = ConvertTo-AppVersion $r.appTag
+        $cv = ConvertTo-AppVersion $script:AppVersion
+        if ($nv -and $cv) {
+            if ($nv -gt $cv -and $r.appUrl) {
+                $script:AppUpdate = @{ ver = $nv.ToString(); url = $r.appUrl; page = $r.appPage }
+                $ui.TxtAppLatest.Text = "Доступна новая версия Zapret Control: $nv"
+                $ui.TxtAppLatest.Foreground = $BrAmber
+                $ui.BtnAppUpd.Visibility = 'Visible'
+                Log "Доступно обновление Zapret Control: $script:AppVersion -> $nv (вкладка Управление → Обновление)"
+            } else {
+                $script:AppUpdate = $null
+                $ui.TxtAppLatest.Text = 'Последняя версия'
+                $ui.TxtAppLatest.Foreground = $BrGreenTx
+                $ui.BtnAppUpd.Visibility = 'Collapsed'
+            }
+        } elseif (-not $quiet) {
+            $ui.TxtAppLatest.Text = 'Не удалось проверить (нет связи с GitHub?)'
+            $ui.TxtAppLatest.Foreground = $BrRedTx
+        }
     }
+    if (-not $started) { $ui.BtnCheckUpd.IsEnabled = $true }
+}
+
+$ui.BtnCheckUpd.Add_Click({ Start-UpdateCheck $false })
+
+$ui.BtnAppUpd.Add_Click({
+    $u = $script:AppUpdate
+    if (-not $u) { Show-Info 'Обновлений нет' 'Сначала нажми «Проверить».'; return }
+    if (-not $script:SelfPath -or -not (Test-Path -LiteralPath $script:SelfPath)) {
+        Show-Info 'Обнови вручную' "Не могу найти свой файл, чтобы заменить его. Скачай новую версию со страницы релизов:`n$($u.page)"
+        return
+    }
+    Show-Confirm "Обновить Zapret Control до $($u.ver)?" "Скачаю новую версию с GitHub и заменю файл приложения (старый сохранится рядом как ZapretGUI.ps1.bak). Папку zapret, службу и настройки не трогаю. После обновления приложение перезапустится." 'Обновить' $false {
+        # внутри отложенного блока локальной $u уже нет — берём из script-переменной
+        $u = $script:AppUpdate
+        Log "Обновление Zapret Control: $script:AppVersion -> $($u.ver)"
+        Start-Bg -BusyText "Скачиваю Zapret Control $($u.ver)..." -Params @{ url = $u.url; selfPath = $script:SelfPath; ver = $u.ver; cur = $script:AppVersion } -Body @'
+$tmp = Join-Path $env:TEMP ('zc_upd_' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $zip = Join-Path $tmp 'zc.zip'
+    Invoke-WebRequest -Uri $CTX.url -OutFile $zip -TimeoutSec 120 -UseBasicParsing
+    BgBusy 'Проверяю скачанный файл...'
+    $ex = Join-Path $tmp 'ex'
+    Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force
+    $ps1 = Get-ChildItem -LiteralPath $ex -Recurse -Filter 'ZapretGUI.ps1' | Select-Object -First 1
+    if (-not $ps1) { throw 'в архиве нет ZapretGUI.ps1' }
+    $txt = [IO.File]::ReadAllText($ps1.FullName, [Text.Encoding]::UTF8)
+    if ($txt -notmatch "\`$script:AppVersion = '([^']+)'") { throw 'файл в архиве не похож на Zapret Control' }
+    $got = $Matches[1]
+    if (-not ([version]$got -gt [version]$CTX.cur)) { throw "в архиве версия $got, а установлена $($CTX.cur) — обновлять нечего" }
+    $errs = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($txt, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count) { throw ('файл не проходит проверку синтаксиса: ' + $errs[0].Message) }
+
+    BgBusy 'Заменяю файл приложения...'
+    Copy-Item -LiteralPath $CTX.selfPath -Destination ($CTX.selfPath + '.bak') -Force
+    # пишем строго с BOM — без него PowerShell 5.1 читает кириллицу как мусор
+    [IO.File]::WriteAllText($CTX.selfPath, $txt, (New-Object System.Text.UTF8Encoding($true)))
+    $bat = Get-ChildItem -LiteralPath $ex -Recurse -Filter 'Zapret GUI.bat' | Select-Object -First 1
+    if ($bat) { Copy-Item -LiteralPath $bat.FullName -Destination (Join-Path (Split-Path $CTX.selfPath -Parent) 'Zapret GUI.bat') -Force }
+    BgLog ("Zapret Control обновлён до " + $got + " (резервная копия: ZapretGUI.ps1.bak)")
+    @{ ok = $true; ver = $got }
+} catch {
+    BgLog ('ОШИБКА обновления приложения: ' + $_.Exception.Message)
+    @{ ok = $false; err = $_.Exception.Message }
+} finally {
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+'@ -OnDone {
+            param($res)
+            $r = @($res)[-1]
+            if ($r -and $r.ok) {
+                $ui.BtnAppUpd.Visibility = 'Collapsed'
+                $ui.TxtAppLatest.Text = "Установлена версия $($r.ver) — нужен перезапуск"
+                $ui.TxtAppLatest.Foreground = $BrGreenTx
+                Show-Confirm 'Приложение обновлено' "Zapret Control $($r.ver) установлен. Перезапустить сейчас?" 'Перезапустить' $false {
+                    $script:RestartPath = $script:SelfPath
+                    $win.Close()
+                } { Log 'Новая версия заработает после перезапуска приложения' }
+            } elseif ($r) {
+                Show-Info 'Не удалось обновить' "$($r.err)`n`nМожно скачать вручную: $($script:AppUpdate.page)"
+            }
+        }
+    } $null
 })
 
 $ui.BtnDoUpd.Add_Click({
@@ -2432,10 +2718,11 @@ try {
             param($res)
             $r = @($res)[-1]
             if ($r -and $r.ok) {
-                $ui.TxtVerLocal.Text = "Установлено: $(Get-LocalVersion)"
+                $ui.TxtVerLocal.Text = "zapret: $(Get-LocalVersion)"
                 $ui.TxtVerLatest.Text = "Обновлено до $($r.version)"
                 $ui.TxtVerLatest.Foreground = $BrGreenTx
                 $ui.BtnDoUpd.Visibility = 'Collapsed'
+                Refresh-Strategies
                 Show-Info 'Обновление завершено' "zapret обновлён до $($r.version). Твои списки и настройки перенесены, служба переустановлена.`n`nСтарая версия сохранена рядом в папке с суффиксом _backup."
             } elseif ($r) {
                 Show-Info 'Не удалось обновить' "$($r.err)`n`nСкачать вручную: $script:MirrorPage"
@@ -2474,7 +2761,33 @@ $pollTimer.Add_Tick({
             try { & $done $result } catch { Log "ОШИБКА обработки результата: $($_.Exception.Message)" }
         }
     }
+    if ($script:QHandle -and $script:QHandle.IsCompleted) {
+        $result = $null
+        try { $result = $script:QPs.EndInvoke($script:QHandle) }
+        catch { Log "ОШИБКА фоновой проверки: $($_.Exception.Message)" }
+        $ps = $script:QPs; $done = $script:QOnDone
+        $script:QPs = $null; $script:QHandle = $null; $script:QOnDone = $null
+        try { $ps.Runspace.Close(); $ps.Dispose() } catch {}
+        if ($done) {
+            try { & $done $result } catch { Log "ОШИБКА обработки результата: $($_.Exception.Message)" }
+        }
+    }
 })
+
+# Положение окна: восстанавливаем, только если оно целиком видно на текущих мониторах
+function Restore-WindowPlacement {
+    $s = Get-AppSettings
+    if (-not $s -or -not $s.w -or -not $s.h) { return }
+    try {
+        $vx = [System.Windows.SystemParameters]::VirtualScreenLeft;  $vy = [System.Windows.SystemParameters]::VirtualScreenTop
+        $vw = [System.Windows.SystemParameters]::VirtualScreenWidth; $vh = [System.Windows.SystemParameters]::VirtualScreenHeight
+        $w = [double]$s.w; $h = [double]$s.h; $x = [double]$s.x; $y = [double]$s.y
+        if ($w -lt $win.MinWidth -or $h -lt $win.MinHeight) { return }
+        if ($x -lt $vx -or $y -lt $vy -or ($x + $w) -gt ($vx + $vw) -or ($y + $h) -gt ($vy + $vh)) { return }
+        $win.WindowStartupLocation = 'Manual'
+        $win.Left = $x; $win.Top = $y; $win.Width = $w; $win.Height = $h
+    } catch {}
+}
 
 # Не даём закрыть окно посреди установки службы — иначе она останется недоделанной
 $win.Add_Closing({
@@ -2485,17 +2798,34 @@ $win.Add_Closing({
         return
     }
     if ($script:BgCancel) { $script:BgCancel.stop = $true }
+    if ($win.WindowState -eq 'Normal') {
+        Save-AppSettings @{ x = [int]$win.Left; y = [int]$win.Top; w = [int]$win.ActualWidth; h = [int]$win.ActualHeight }
+    }
 })
 
 # ---------- Start ----------
 Update-Status
-$ui.TxtVerLocal.Text = "Установлено: $(Get-LocalVersion)"
+$ui.TxtVerLocal.Text = "zapret: $(Get-LocalVersion)"
 Log "Zapret Control $script:AppVersion — управляю папкой: $script:Root"
+Restore-WindowPlacement
 $statusTimer.Start()
 $pollTimer.Start()
+
+# Тихая проверка версий через пару секунд после старта — если включена в параметрах
+if (Test-Path (Join-Path $script:Utils 'check_updates.enabled')) {
+    $startupTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $startupTimer.Interval = [TimeSpan]::FromSeconds(2)
+    $startupTimer.Add_Tick({ $startupTimer.Stop(); Start-UpdateCheck $true })
+    $startupTimer.Start()
+}
 
 [void]$win.ShowDialog()
 
 $statusTimer.Stop()
 $pollTimer.Stop()
 if ($script:AppMutex) { try { $script:AppMutex.ReleaseMutex() } catch {} }
+
+# Перезапуск после самообновления — уже после того, как отпустили мьютекс
+if ($script:RestartPath) {
+    try { Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script:RestartPath`"" } catch {}
+}
