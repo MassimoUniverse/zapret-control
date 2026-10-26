@@ -15,7 +15,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4.0'
+$script:AppVersion = '1.4.1'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -2080,19 +2080,35 @@ BgLog 'Служба перезапущена'
     }
 })
 
+# Люди вставляют адреса как есть («https://site.com/page») — zapret такие строки не матчит, нужен голый домен
+function ConvertTo-BareDomain([string]$line) {
+    $t = $line.Trim()
+    if ($t -eq '' -or $t.StartsWith('#')) { return $line }
+    $t = $t -replace '^(?i)[a-z][a-z0-9+.\-]*://', ''   # схема
+    $t = $t -replace '^[^/]*@', ''                        # user:pass@
+    $t = ($t -split '[/?#\s]', 2)[0]                     # путь, запрос, хвост
+    $t = $t -replace ':\d+$', ''                          # порт
+    $t = $t -replace '^www\.', ''
+    return $t.ToLower()
+}
+
 function Save-ListFile([string]$path, [string]$text, [string]$title) {
     $lines = ($text -replace "`r`n", "`n").Trim("`n") -split "`n"
-    $converted = 0
+    $converted = 0; $cleaned = 0
     $out = foreach ($l in $lines) {
-        $p = ConvertTo-Punycode $l
-        if ($p -ne $l) { $converted++ }
+        $d = ConvertTo-BareDomain $l
+        if ($d -ne $l.Trim()) { $cleaned++ }
+        $p = ConvertTo-Punycode $d
+        if ($p -ne $d) { $converted++ }
         $p
     }
-    $body = ($out -join "`r`n").Trim()
+    $body = ($out | Where-Object { $_ -ne '' } | Select-Object -Unique) -join "`r`n"
     if ([string]::IsNullOrWhiteSpace($body)) { $body = 'domain.example.abc' }
     Set-Content -LiteralPath $path -Value $body -Encoding ASCII
-    if ($converted -gt 0) { Log "$title сохранён (доменов переведено в punycode: $converted)" }
-    else { Log "$title сохранён" }
+    $notes = @()
+    if ($cleaned -gt 0)   { $notes += "адресов приведено к домену: $cleaned" }
+    if ($converted -gt 0) { $notes += "переведено в punycode: $converted" }
+    if ($notes.Count) { Log "$title сохранён ($($notes -join ', '))" } else { Log "$title сохранён" }
     if ((Get-Service -Name zapret -ErrorAction SilentlyContinue).Status -eq 'Running') {
         Show-Confirm 'Перезапустить службу?' 'Список сохранён. Чтобы winws подхватил изменения, службу нужно перезапустить.' 'Перезапустить' $false {
             Start-Bg -BusyText 'Перезапускаю службу...' -Body @'
