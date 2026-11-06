@@ -8,6 +8,7 @@
 #  1.4: самообновление приложения, тихая проверка версий при запуске,
 #       подсказки, DNS в диагностике, Esc/Enter в диалогах, память окна
 #  1.5: режим Lineage 2 — обход на портах Линейки для любых серверов
+#  1.6: вкладка «Соединения» — журнал, к каким адресам не удаётся подключиться
 # ============================================================
 param(
     [switch]$TestParse,
@@ -16,7 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.5.0'
+$script:AppVersion = '1.6.0'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -1572,6 +1573,52 @@ $xaml = @'
             </Grid>
           </TabItem>
 
+          <TabItem Header="Соединения" Tag="&#x21C4;">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <Border Grid.Row="0" Style="{StaticResource Card}">
+                <StackPanel>
+                  <Grid>
+                    <StackPanel MaxWidth="520" HorizontalAlignment="Left">
+                      <TextBlock Text="Ж&#x2009;У&#x2009;Р&#x2009;Н&#x2009;А&#x2009;Л&#x2009;&#x2009;С&#x2009;О&#x2009;Е&#x2009;Д&#x2009;И&#x2009;Н&#x2009;Е&#x2009;Н&#x2009;И&#x2009;Й" Style="{StaticResource Kicker}"/>
+                      <TextBlock Text="Куда не получается подключиться" FontSize="18" FontWeight="SemiBold" Margin="0,10,0,0"/>
+                      <TextBlock Style="{StaticResource Muted}" FontSize="13" Margin="0,6,0,0"
+                                 Text="Нажми «Начать запись», повтори проблему — открой игру, сайт или программу — и останови. Будет видно, какая программа к каким адресам стучалась и что с каждым соединением случилось."/>
+                    </StackPanel>
+                    <Button x:Name="BtnConnStart" Content="Начать запись" Style="{StaticResource Accent}" HorizontalAlignment="Right" VerticalAlignment="Top"
+                            ToolTip="Следит за всеми TCP-соединениями компьютера, пока не остановишь (максимум 15 минут). Ничего не меняет и никуда не отправляет."/>
+                  </Grid>
+                  <Grid Margin="0,16,0,0">
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock x:Name="TxtConnStatus" Grid.Row="1" Text="Запись не идёт" Foreground="{StaticResource TextMid}" FontSize="12.5"
+                               TextWrapping="Wrap" Margin="0,12,0,0"/>
+                    <StackPanel Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Right">
+                      <TextBlock Text="Только проблемные" Foreground="{StaticResource TextMid}" FontSize="12.5" VerticalAlignment="Center"/>
+                      <ToggleButton x:Name="TglConnBad" Style="{StaticResource Switch}" Margin="10,0,16,0" VerticalAlignment="Center"
+                                    ToolTip="Скрыть адреса, к которым всё подключалось нормально"/>
+                      <Button x:Name="BtnConnCopy" Content="Скопировать" Padding="14,8" IsEnabled="False"
+                              ToolTip="Скопирует сводку по адресам в буфер обмена — вставь её в сообщение, когда просишь помощи."/>
+                      <Button x:Name="BtnConnSave" Content="Сохранить в файл" Padding="14,8" Margin="8,0,0,0" IsEnabled="False"
+                              ToolTip="Сохранит полный журнал — сводку и каждое соединение по времени — в текстовый файл и покажет его в Проводнике."/>
+                    </StackPanel>
+                  </Grid>
+                </StackPanel>
+              </Border>
+              <Border Grid.Row="1" Background="{StaticResource WellBg}" BorderBrush="{StaticResource Line}" BorderThickness="1"
+                      CornerRadius="14" Padding="8,10" Margin="0,0,0,16">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                  <StackPanel x:Name="ConnList"/>
+                </ScrollViewer>
+              </Border>
+            </Grid>
+          </TabItem>
+
         </TabControl>
 
         <Border Grid.Row="2" Background="{StaticResource SideBg}" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0"
@@ -1655,6 +1702,7 @@ foreach ($n in @('TitleBar','BtnMin','BtnClose','TxtRoot','PillService','DotServ
                  'TxtVerLocal','TxtVerLatest','BtnCheckUpd','BtnDoUpd','LnkTg','LnkGh','TxtVer','TxtGameSub',
                  'TxtAppVer','TxtAppLatest','BtnAppUpd',
                  'BtnDiag','BtnReport','BtnRestartSvc','BtnOpenFolder','BtnKillWinws','BtnFixDivert','BtnDiscordCache','BtnOpenLog','BtnResetAll','TxtDiag','TxtLog',
+                 'BtnConnStart','TxtConnStatus','TglConnBad','BtnConnCopy','BtnConnSave','ConnList',
                  'DialogOverlay','DlgTitle','DlgMsg','DlgYes','DlgNo',
                  'BusyOverlay','BusyText','BusySub','BtnBusyCancel','MainTabs')) {
     $ui[$n] = $win.FindName($n)
@@ -2527,6 +2575,13 @@ $ui.BtnReport.Add_Click({
     $dt = $range.Text.Trim()
     [void]$sb.AppendLine($(if ($dt) { $dt } else { '(не запускалась)' }))
     [void]$sb.AppendLine('')
+    if ($script:MonState -and @($script:MonState.snap).Count) {
+        $bad = @(Get-ConnSorted | Where-Object { (Get-ConnLevel $_) -gt 0 } | Select-Object -First 15)
+        [void]$sb.AppendLine("--- Журнал соединений: проблемные адреса ($($bad.Count)) ---")
+        foreach ($a in $bad) { [void]$sb.AppendLine(("{0} -> {1} · {2}" -f $a.proc, (Get-ConnTarget $a), (Get-ConnBreakdown $a))) }
+        if (-not $bad.Count) { [void]$sb.AppendLine('(нет — всё подключалось)') }
+        [void]$sb.AppendLine('')
+    }
     [void]$sb.AppendLine('--- Журнал ---')
     [void]$sb.AppendLine($ui.TxtLog.Text.Trim())
     try {
@@ -2910,10 +2965,430 @@ try {
     } $null
 })
 
+# ---------- Журнал соединений ----------
+# Таблицу TCP-соединений с PID читаем напрямую через iphlpapi: Get-NetTCPConnection тратит ~1 с на вызов,
+# а здесь опрос раз в 0,4 с. Прав администратора не нужно.
+$script:ConnTypeSrc = @'
+using System; using System.Collections.Generic; using System.Net; using System.Runtime.InteropServices;
+public static class ZcTcpTable {
+    [DllImport("iphlpapi.dll")]
+    static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool order, int af, int tableClass, uint reserved);
+    public class Row { public int State; public string Remote; public int RemotePort; public int LocalPort; public int Pid; }
+    static int Port(int v) { return ((v & 0xFF) << 8) | ((v >> 8) & 0xFF); }
+    public static List<Row> Read() { var list = new List<Row>(); Fill(list, 2); Fill(list, 23); return list; }
+    static void Fill(List<Row> list, int af) {
+        int size = 0;
+        GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, 5, 0);
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (size <= 0) return;
+            IntPtr buf = Marshal.AllocHGlobal(size);
+            try {
+                uint r = GetExtendedTcpTable(buf, ref size, false, af, 5, 0);
+                if (r == 122) continue;
+                if (r != 0) return;
+                int n = Marshal.ReadInt32(buf);
+                for (int i = 0; i < n; i++) {
+                    var row = new Row();
+                    if (af == 2) {
+                        IntPtr p = IntPtr.Add(buf, 4 + i * 24);
+                        row.State = Marshal.ReadInt32(p, 0);
+                        row.LocalPort = Port(Marshal.ReadInt32(p, 8));
+                        row.Remote = new IPAddress((long)(uint)Marshal.ReadInt32(p, 12)).ToString();
+                        row.RemotePort = Port(Marshal.ReadInt32(p, 16));
+                        row.Pid = Marshal.ReadInt32(p, 20);
+                    } else {
+                        IntPtr p = IntPtr.Add(buf, 4 + i * 56);
+                        byte[] a = new byte[16]; Marshal.Copy(IntPtr.Add(p, 24), a, 0, 16);
+                        var ip = new IPAddress(a);
+                        row.Remote = ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4().ToString() : ip.ToString();
+                        row.LocalPort = Port(Marshal.ReadInt32(p, 20));
+                        row.RemotePort = Port(Marshal.ReadInt32(p, 44));
+                        row.State = Marshal.ReadInt32(p, 48);
+                        row.Pid = Marshal.ReadInt32(p, 52);
+                    }
+                    list.Add(row);
+                }
+                return;
+            } finally { Marshal.FreeHGlobal(buf); }
+        }
+    }
+}
+'@
+
+# Фоновый опрос. Как понимаем, что случилось с соединением (состояния TCP из таблицы):
+#   ждало ответа (SYN_SENT) и исчезло, не подключившись   -> «нет ответа» (>=1 с) или «сброшено сразу» (<1 с)
+#   подключилось и исчезло за <2 с без нормального закрытия -> «оборвалось сразу» (так выглядит RST от DPI)
+#   подключилось, но ждало ответа >=3 с                    -> «подключилось медленно»
+# Нормальное закрытие с нашей стороны оставляет в таблице TIME_WAIT — по нему отличаем его от обрыва.
+$script:ConnMonBody = @'
+if (-not ('ZcTcpTable' -as [type])) { Add-Type -TypeDefinition $CTX.typeSrc -Language CSharp }
+$conns = @{}; $agg = @{}; $names = @{}; $procs = @{}; $ignore = @{}
+$events = $MON.events
+$start = Get-Date
+function IsLocalIp([string]$ip) { return ($ip -eq '0.0.0.0' -or $ip -eq '::' -or $ip -like '127.*' -or $ip -eq '::1') }
+function ProcName([int]$id) {
+    if ($procs.ContainsKey($id)) { return $procs[$id] }
+    $n = "pid $id"
+    try { $n = [System.Diagnostics.Process]::GetProcessById($id).ProcessName + '.exe' } catch {}
+    $procs[$id] = $n
+    return $n
+}
+function RefreshNames {
+    try {
+        foreach ($e in @(Get-DnsClientCache -ErrorAction Stop)) {
+            if ($e.Data -and ($e.Type -eq 1 -or $e.Type -eq 28)) { $names[[string]$e.Data] = [string]$e.Entry }
+        }
+    } catch {}
+}
+function Finish($c, [string]$st, [datetime]$now) {
+    $dom = $names[$c.remote]
+    $dur = if ($c.est) { ($c.est - $c.first).TotalSeconds } else { ($now - $c.first).TotalSeconds }
+    [void]$events.Add(@{ t = $c.first; proc = $c.proc; remote = $c.remote; rport = $c.rport; dom = $dom; st = $st; dur = [math]::Round($dur, 2) })
+    if ($events.Count -gt 20000) { $events.RemoveRange(0, 2000) }
+    $ak = "$($c.proc)|$($c.remote)|$($c.rport)"
+    $a = $agg[$ak]
+    if (-not $a) {
+        $a = @{ proc = $c.proc; remote = $c.remote; rport = $c.rport; dom = $dom; n = 0; ok = 0; slow = 0; noanswer = 0; reset = 0; drop = 0; last = $now }
+        $agg[$ak] = $a
+    }
+    $a.n++
+    if ($st -eq 'slow') { $a.slow++; $a.ok++ } else { $a[$st]++ }
+    $a.last = $now
+    if (-not $a.dom -and $dom) { $a.dom = $dom }
+    $MON.dirty = $true
+}
+function Publish {
+    foreach ($a in $agg.Values) { if (-not $a.dom -and $names.ContainsKey($a.remote)) { $a.dom = $names[$a.remote] } }
+    $MON.snap = @(foreach ($a in $agg.Values) { $a.Clone() })
+    $MON.total = $events.Count
+    $MON.ver++
+    $MON.dirty = $false
+}
+
+RefreshNames
+$lastNames = Get-Date
+# то, что было открыто до начала записи, не оцениваем — мы не видели, как оно начиналось
+foreach ($r in [ZcTcpTable]::Read()) { $ignore["$($r.Pid)|$($r.LocalPort)|$($r.Remote)|$($r.RemotePort)"] = 1 }
+$MON.running = $true
+
+while (-not $MON.stop) {
+    try {
+        $now = Get-Date
+        if (($now - $lastNames).TotalSeconds -ge 3) { RefreshNames; $lastNames = $now }
+        $seen = @{}; $tw = @{}
+        $table = [ZcTcpTable]::Read()
+        # входящие соединения (к нашему слушающему порту) не интересны — смотрим только, куда подключаемся мы
+        $listen = @{}
+        foreach ($r in $table) { if ($r.State -eq 2) { $listen[$r.LocalPort] = 1 } }
+        foreach ($r in $table) {
+            if ($r.State -eq 2 -or $listen.ContainsKey($r.LocalPort)) { continue }
+            if ((IsLocalIp $r.Remote) -and -not $CTX.loopback) { continue }
+            $tuple = "$($r.LocalPort)|$($r.Remote)|$($r.RemotePort)"
+            if ($r.State -eq 11 -or $r.Pid -eq 0) { $tw[$tuple] = 1; continue }
+            $key = "$($r.Pid)|$tuple"
+            $seen[$key] = 1
+            if ($ignore.ContainsKey($key)) { continue }
+            $c = $conns[$key]
+            if (-not $c) {
+                $c = @{ proc = (ProcName $r.Pid); lport = $r.LocalPort; remote = $r.Remote; rport = $r.RemotePort; first = $now; syn = ($r.State -eq 3); est = $null; fin = $false }
+                $conns[$key] = $c
+            }
+            if ($r.State -ge 5 -and $r.State -le 10 -and -not $c.est) { $c.est = $now }
+            if ($r.State -ge 6 -and $r.State -le 10) { $c.fin = $true }
+        }
+        foreach ($key in @($conns.Keys)) {
+            if ($seen.ContainsKey($key)) { continue }
+            $c = $conns[$key]; $conns.Remove($key)
+            $closedByUs = $tw.ContainsKey("$($c.lport)|$($c.remote)|$($c.rport)")
+            if ($c.est -or $closedByUs) {
+                if (-not $c.est) { $c.est = $now }
+                $alive = ($now - $c.est).TotalSeconds
+                if (-not $closedByUs -and -not $c.fin -and $alive -lt 2) { Finish $c 'drop' $now }
+                elseif ($c.syn -and ($c.est - $c.first).TotalSeconds -ge 3) { Finish $c 'slow' $now }
+                else { Finish $c 'ok' $now }
+            } else {
+                Finish $c $(if (($now - $c.first).TotalSeconds -ge 1) { 'noanswer' } else { 'reset' }) $now
+            }
+        }
+        # то, что прямо сейчас висит в ожидании ответа дольше 2 с — показываем вживую
+        $MON.pending = @($conns.Values | Where-Object { -not $_.est -and $_.syn -and ($now - $_.first).TotalSeconds -ge 2 } |
+                         ForEach-Object { "$($_.proc) -> $($_.remote):$($_.rport)" })
+        if ($MON.dirty -or $MON.ver -eq 0) { Publish }
+        if (($now - $start).TotalMinutes -ge 15) { $MON.autostop = $true; break }
+    } catch { $MON.err = $_.Exception.Message }
+    Start-Sleep -Milliseconds 400
+}
+
+# остановка: открытые соединения считаем удачными, а висящие без ответа — неудачными
+$now = Get-Date
+foreach ($c in @($conns.Values)) {
+    if ($c.est) { Finish $c $(if ($c.syn -and ($c.est - $c.first).TotalSeconds -ge 3) { 'slow' } else { 'ok' }) $now }
+    elseif ($c.syn -and ($now - $c.first).TotalSeconds -ge 2) { Finish $c 'noanswer' $now }
+}
+$MON.pending = @()
+Publish
+$MON.ended = $now
+$MON.running = $false
+'@
+
+$script:ConnStatusText = @{ ok = 'подключилось'; slow = 'подключилось медленно'; noanswer = 'нет ответа'; reset = 'сброшено сразу'; drop = 'оборвалось сразу' }
+$script:MonState = $null
+$script:MonPs = $null; $script:MonHandle = $null
+$script:MonShownVer = -1
+
+function Get-ConnLevel($a) {
+    $bad = [int]$a.noanswer + [int]$a.reset + [int]$a.drop
+    if ([int]$a.ok -eq 0 -and $bad -gt 0) { return 2 }
+    if ($bad -gt 0 -or [int]$a.slow -gt 0) { return 1 }
+    return 0
+}
+
+function Get-ConnTarget($a) {
+    if ($a.dom) { return "$($a.dom):$($a.rport)  ($($a.remote))" }
+    return "$($a.remote):$($a.rport)"
+}
+
+function Get-ConnBreakdown($a) {
+    $parts = @("подключилось $($a.ok)")
+    if ([int]$a.slow)     { $parts += "из них медленно $($a.slow)" }
+    if ([int]$a.noanswer) { $parts += "нет ответа $($a.noanswer)" }
+    if ([int]$a.reset)    { $parts += "сброшено сразу $($a.reset)" }
+    if ([int]$a.drop)     { $parts += "оборвалось сразу $($a.drop)" }
+    return "попыток $($a.n): " + ($parts -join ', ')
+}
+
+function Get-ConnSorted {
+    if (-not $script:MonState) { return @() }
+    return @(@($script:MonState.snap) | Sort-Object @{ Expression = { Get-ConnLevel $_ }; Descending = $true },
+                                                   @{ Expression = { $_.last }; Descending = $true })
+}
+
+function Format-Duration([timespan]$d) {
+    if ($d.TotalHours -ge 1) { return '{0}:{1:00}:{2:00}' -f [int][math]::Floor($d.TotalHours), $d.Minutes, $d.Seconds }
+    return '{0:00}:{1:00}' -f [int][math]::Floor($d.TotalMinutes), $d.Seconds
+}
+
+function Update-ConnStatus {
+    $m = $script:MonState
+    if (-not $m) { $ui.TxtConnStatus.Text = 'Запись не идёт'; return }
+    $end = if ($m.ended) { $m.ended } else { Get-Date }
+    $snap = @($m.snap)
+    $badN = @($snap | Where-Object { (Get-ConnLevel $_) -eq 2 }).Count
+    $head = if ($m.running -or -not $m.ended) { 'Запись идёт' } else { 'Записано' }
+    $txt = "$head · $(Format-Duration ($end - $m.started)) · соединений $($m.total) · адресов $($snap.Count) · не подключается $badN"
+    $pend = @($m.pending)
+    if ($pend.Count) { $txt += " · ждут ответа: " + ($pend[0..([math]::Min(1, $pend.Count - 1))] -join ', ') }
+    if ($m.err) { $txt += " · ошибка: $($m.err)" }
+    $ui.TxtConnStatus.Text = $txt
+    $ui.TxtConnStatus.Foreground = $(if ($badN -gt 0) { $BrAmber } else { $BrGrayTx })
+}
+
+function Render-ConnList {
+    $ui.ConnList.Children.Clear()
+    $all = Get-ConnSorted
+    $items = if ($ui.TglConnBad.IsChecked) { @($all | Where-Object { (Get-ConnLevel $_) -gt 0 }) } else { $all }
+    $hasData = $all.Count -gt 0
+    $ui.BtnConnCopy.IsEnabled = $hasData
+    $ui.BtnConnSave.IsEnabled = $hasData
+    if (-not $items.Count) {
+        $hint = New-Object System.Windows.Controls.TextBlock
+        $hint.Text = if (-not $script:MonState) { 'Здесь появятся адреса, к которым подключались программы во время записи.' }
+                     elseif ($hasData) { 'Проблемных адресов нет — всё, к чему подключались, ответило.' }
+                     else { 'Пока ни одного нового соединения. Открой то, что не работает, — строки появятся здесь.' }
+        $hint.FontSize = 12.5; $hint.Foreground = $BrGrayTx; $hint.TextWrapping = 'Wrap'
+        $hint.Margin = New-Object System.Windows.Thickness 12,6,12,6
+        $ui.ConnList.Children.Add($hint) | Out-Null
+        return
+    }
+    $max = 200
+    foreach ($a in @($items | Select-Object -First $max)) {
+        $lvl = Get-ConnLevel $a
+        $row = New-Object System.Windows.Controls.Grid
+        $row.Margin = New-Object System.Windows.Thickness 6,4,6,4
+        foreach ($w in 'Auto', '*', 'Auto', 'Auto') { $cd = New-Object System.Windows.Controls.ColumnDefinition; $cd.Width = $w; $row.ColumnDefinitions.Add($cd) }
+
+        $dot = New-Object System.Windows.Shapes.Ellipse
+        $dot.Width = 7; $dot.Height = 7; $dot.VerticalAlignment = 'Center'
+        $dot.Margin = New-Object System.Windows.Thickness 6,0,0,0
+        $dot.Fill = switch ($lvl) { 2 { $BrRed } 1 { $BrAmber } default { $BrGreen } }
+        [System.Windows.Controls.Grid]::SetColumn($dot, 0)
+
+        $txt = New-Object System.Windows.Controls.TextBlock
+        $txt.FontFamily = New-Object System.Windows.Media.FontFamily 'Consolas'
+        $txt.FontSize = 12.5; $txt.VerticalAlignment = 'Center'; $txt.TextTrimming = 'CharacterEllipsis'
+        $txt.Margin = New-Object System.Windows.Thickness 12,0,10,0
+        $r1 = New-Object System.Windows.Documents.Run ([string]$a.proc); $r1.Foreground = $BrGrayTx
+        $r2 = New-Object System.Windows.Documents.Run ('  →  ' + (Get-ConnTarget $a)); $r2.Foreground = $BrBody
+        $txt.Inlines.Add($r1); $txt.Inlines.Add($r2)
+        $txt.ToolTip = "$($a.proc) → $(Get-ConnTarget $a)`n$(Get-ConnBreakdown $a)"
+        [System.Windows.Controls.Grid]::SetColumn($txt, 1)
+
+        $bad = [int]$a.noanswer + [int]$a.reset + [int]$a.drop
+        $st = New-Object System.Windows.Controls.TextBlock
+        $st.FontSize = 12.5; $st.FontWeight = 'Medium'; $st.VerticalAlignment = 'Center'
+        $st.Margin = New-Object System.Windows.Thickness 0,0,12,0
+        switch ($lvl) {
+            2 {
+                $why = if ([int]$a.noanswer -ge [int]$a.reset -and [int]$a.noanswer -ge [int]$a.drop) { 'нет ответа' }
+                       elseif ([int]$a.drop -ge [int]$a.reset) { 'обрывается' } else { 'сброс' }
+                $st.Text = "не подключается · $why · $bad из $($a.n)"; $st.Foreground = $BrRedTx
+            }
+            1 {
+                $st.Text = if ($bad) { "с ошибками · $bad из $($a.n)" } else { "медленно · $($a.slow) из $($a.n)" }
+                $st.Foreground = $BrAmber
+            }
+            default { $st.Text = "ок · $($a.n)"; $st.Foreground = $BrGreenTx }
+        }
+        $st.ToolTip = Get-ConnBreakdown $a
+        [System.Windows.Controls.Grid]::SetColumn($st, 2)
+
+        $tm = New-Object System.Windows.Controls.TextBlock
+        $tm.Text = ([datetime]$a.last).ToString('HH:mm:ss')
+        $tm.FontFamily = New-Object System.Windows.Media.FontFamily 'Consolas'
+        $tm.FontSize = 11.5; $tm.Foreground = $BrGray; $tm.VerticalAlignment = 'Center'
+        $tm.Margin = New-Object System.Windows.Thickness 0,0,6,0
+        [System.Windows.Controls.Grid]::SetColumn($tm, 3)
+
+        foreach ($el in $dot, $txt, $st, $tm) { $row.Children.Add($el) | Out-Null }
+        $ui.ConnList.Children.Add($row) | Out-Null
+    }
+    if ($items.Count -gt $max) {
+        $more = New-Object System.Windows.Controls.TextBlock
+        $more.Text = "…и ещё $($items.Count - $max). Полный список — в файле («Сохранить в файл»)."
+        $more.FontSize = 12; $more.Foreground = $BrGrayTx
+        $more.Margin = New-Object System.Windows.Thickness 12,8,12,4
+        $ui.ConnList.Children.Add($more) | Out-Null
+    }
+}
+
+# Текст для файла / буфера обмена. $timeline — добавить хронологию всех соединений
+function Get-ConnReportText([bool]$timeline) {
+    $m = $script:MonState
+    $sb = New-Object System.Text.StringBuilder
+    $end = if ($m.ended) { $m.ended } else { Get-Date }
+    [void]$sb.AppendLine("=== Zapret Control $script:AppVersion — журнал соединений ===")
+    [void]$sb.AppendLine("Запись: $($m.started.ToString('yyyy-MM-dd HH:mm:ss')) – $($end.ToString('HH:mm:ss')) ($(Format-Duration ($end - $m.started)))$(if ($m.autostop) { ', остановлена автоматически через 15 минут' })")
+    [void]$sb.AppendLine("Во время записи: zapret $($m.ctx.zapret) · стратегия: $($m.ctx.strategy) · FACEIT: $($m.ctx.faceit) · Lineage 2: $($m.ctx.lineage)")
+    [void]$sb.AppendLine("Соединений: $($m.total) · адресов: $(@($m.snap).Count)")
+    [void]$sb.AppendLine('Видны только TCP-соединения: голос Discord и игры на UDP так не отследить.')
+    $all = Get-ConnSorted
+    foreach ($sec in @(@{ t = 'Не подключается'; l = 2 }, @{ t = 'С ошибками'; l = 1 }, @{ t = 'Без проблем'; l = 0 })) {
+        $list = @($all | Where-Object { (Get-ConnLevel $_) -eq $sec.l })
+        if (-not $list.Count) { continue }
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine("--- $($sec.t) ($($list.Count)) ---")
+        foreach ($a in $list) {
+            [void]$sb.AppendLine(("{0,-22} -> {1}" -f $a.proc, (Get-ConnTarget $a)))
+            [void]$sb.AppendLine("    $(Get-ConnBreakdown $a) · последняя попытка $(([datetime]$a.last).ToString('HH:mm:ss'))")
+        }
+    }
+    if ($timeline) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('--- Все соединения по времени ---')
+        foreach ($e in @($m.events.ToArray() | Sort-Object { $_.t })) {
+            $tgt = if ($e.dom) { "$($e.dom):$($e.rport) ($($e.remote))" } else { "$($e.remote):$($e.rport)" }
+            [void]$sb.AppendLine(("{0}  {1,-22} {2,-26} {3}  ({4} с)" -f ([datetime]$e.t).ToString('HH:mm:ss.fff'), $e.proc, $script:ConnStatusText[$e.st], $tgt, $e.dur))
+        }
+    }
+    return $sb.ToString()
+}
+
+function Start-ConnMonitor {
+    if ($script:MonPs) { return }
+    $svc = Get-Service -Name zapret -ErrorAction SilentlyContinue
+    $state = [hashtable]::Synchronized(@{
+        stop = $false; running = $false; snap = @(); ver = 0; total = 0; dirty = $false; pending = @()
+        events = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+        started = (Get-Date); ended = $null; autostop = $false; err = ''
+        ctx = @{
+            zapret   = $(if (Get-Process -Name winws -ErrorAction SilentlyContinue) { 'работал' } elseif ($svc) { "НЕ работал (служба: $($svc.Status))" } else { 'НЕ работал (служба не установлена)' })
+            strategy = $(if (Get-CurrentStrategy) { Get-CurrentStrategy } else { '—' })
+            faceit   = $(if (Test-Faceit) { 'вкл' } else { 'выкл' })
+            lineage  = $(if (Test-Lineage) { 'вкл (' + (Get-LineagePorts) + ')' } else { 'выкл' })
+        }
+    })
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('MON', $state)
+    $rs.SessionStateProxy.SetVariable('CTX', @{ typeSrc = $script:ConnTypeSrc; loopback = [bool]$script:ConnLoopback })
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($script:ConnMonBody)
+    $script:MonState = $state
+    $script:MonPs = $ps
+    $script:MonHandle = $ps.BeginInvoke()
+    $script:MonShownVer = -1
+    $ui.BtnConnStart.Content = 'Остановить'
+    $ui.BtnConnStart.Style = $win.FindResource('DangerSolid')
+    Log 'Журнал соединений: запись началась'
+    Update-ConnStatus
+    Render-ConnList
+}
+
+function Stop-ConnMonitor { if ($script:MonState) { $script:MonState.stop = $true } }
+
+# Вызывается таймером: обновляет экран и замечает, что фоновая запись закончилась
+function Poll-ConnMonitor {
+    if (-not $script:MonState) { return }
+    if ($script:MonPs -or $script:MonState.running) { Update-ConnStatus }
+    if ($script:MonState.ver -ne $script:MonShownVer) {
+        $script:MonShownVer = $script:MonState.ver
+        Render-ConnList
+    }
+    if ($script:MonHandle -and $script:MonHandle.IsCompleted) {
+        try { [void]$script:MonPs.EndInvoke($script:MonHandle) } catch { Log "ОШИБКА журнала соединений: $($_.Exception.Message)" }
+        $ps = $script:MonPs
+        $script:MonPs = $null; $script:MonHandle = $null
+        try { $ps.Runspace.Close(); $ps.Dispose() } catch {}
+        if (-not $script:MonState.ended) { $script:MonState.ended = Get-Date }
+        $ui.BtnConnStart.Content = 'Начать запись'
+        $ui.BtnConnStart.Style = $win.FindResource('Accent')
+        $ui.BtnConnStart.IsEnabled = $true
+        Update-ConnStatus
+        Render-ConnList
+        $snap = @($script:MonState.snap)
+        $badN = @($snap | Where-Object { (Get-ConnLevel $_) -eq 2 }).Count
+        Log "Журнал соединений: запись остановлена$(if ($script:MonState.autostop) { ' (прошло 15 минут)' }) — соединений $($script:MonState.total), адресов $($snap.Count), не подключается $badN"
+    }
+}
+
+$ui.BtnConnStart.Add_Click({
+    if ($script:MonPs) { Stop-ConnMonitor; $ui.BtnConnStart.Content = 'Останавливаю...'; $ui.BtnConnStart.IsEnabled = $false; return }
+    Start-ConnMonitor
+})
+$ui.TglConnBad.Add_Click({ Render-ConnList })
+
+$ui.BtnConnCopy.Add_Click({
+    if (-not $script:MonState) { return }
+    try {
+        Set-Clipboard -Value (Get-ConnReportText $false)
+        Log 'Журнал соединений скопирован в буфер обмена'
+        Show-Info 'Скопировано' 'Сводка по адресам в буфере обмена — вставь её в сообщение (Ctrl+V). Полный журнал по времени — кнопка «Сохранить в файл».'
+    } catch { Log "Не удалось скопировать: $($_.Exception.Message)" }
+})
+
+$ui.BtnConnSave.Add_Click({
+    if (-not $script:MonState) { return }
+    $name = 'connections-' + $script:MonState.started.ToString('yyyyMMdd-HHmmss') + '.txt'
+    $path = Join-Path $script:LogDir $name
+    try {
+        [IO.File]::WriteAllText($path, (Get-ConnReportText $true), (New-Object System.Text.UTF8Encoding($true)))
+        Log "Журнал соединений сохранён: $path"
+        Start-Process explorer.exe "/select,`"$path`""
+    } catch {
+        Log "Не удалось сохранить журнал: $($_.Exception.Message)"
+        Show-Info 'Не удалось сохранить' $_.Exception.Message
+    }
+})
+
 # ---------- Таймеры ----------
 $statusTimer = New-Object System.Windows.Threading.DispatcherTimer
 $statusTimer.Interval = [TimeSpan]::FromSeconds(3)
 $statusTimer.Add_Tick({ Update-Status })
+
+$monTimer = New-Object System.Windows.Threading.DispatcherTimer
+$monTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+$monTimer.Add_Tick({ Poll-ConnMonitor })
 
 $pollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $pollTimer.Interval = [TimeSpan]::FromMilliseconds(200)
@@ -2977,6 +3452,7 @@ $win.Add_Closing({
         return
     }
     if ($script:BgCancel) { $script:BgCancel.stop = $true }
+    Stop-ConnMonitor
     if ($win.WindowState -eq 'Normal') {
         Save-AppSettings @{ x = [int]$win.Left; y = [int]$win.Top; w = [int]$win.ActualWidth; h = [int]$win.ActualHeight }
     }
@@ -2989,6 +3465,8 @@ Log "Zapret Control $script:AppVersion — управляю папкой: $scrip
 Restore-WindowPlacement
 $statusTimer.Start()
 $pollTimer.Start()
+$monTimer.Start()
+Render-ConnList
 
 # Тихая проверка версий через пару секунд после старта — если включена в параметрах
 if (Test-Path (Join-Path $script:Utils 'check_updates.enabled')) {
@@ -3002,6 +3480,11 @@ if (Test-Path (Join-Path $script:Utils 'check_updates.enabled')) {
 
 $statusTimer.Stop()
 $pollTimer.Stop()
+$monTimer.Stop()
+# фоновая запись соединений выходит из цикла за ~0,4 с после флага stop
+if ($script:MonPs) {
+    try { [void]$script:MonHandle.AsyncWaitHandle.WaitOne(2000); $script:MonPs.Runspace.Close(); $script:MonPs.Dispose() } catch {}
+}
 if ($script:AppMutex) { try { $script:AppMutex.ReleaseMutex() } catch {} }
 
 # Перезапуск после самообновления — уже после того, как отпустили мьютекс
