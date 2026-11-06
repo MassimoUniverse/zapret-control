@@ -7,6 +7,7 @@
 #  1.3: кнопка «Вернуть всё как было»
 #  1.4: самообновление приложения, тихая проверка версий при запуске,
 #       подсказки, DNS в диагностике, Esc/Enter в диалогах, память окна
+#  1.5: режим Lineage 2 — обход на портах Линейки для любых серверов
 # ============================================================
 param(
     [switch]$TestParse,
@@ -15,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4.1'
+$script:AppVersion = '1.5.0'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -297,6 +298,75 @@ function Get-StrategyFiles {
         Sort-Object { [regex]::Replace($_.Name, '\d+', { $args[0].Value.PadLeft(8, '0') }) }
 }
 
+# ---------- Lineage 2 ----------
+# Сервер Линейки — это голый TCP на своих портах (2106 вход, 7777 игра), без домена в трафике.
+# Списки сайтов его не ловят, а FACEIT MODE берёт все порты 1024+ — слишком широко ради одной игры.
+# Поэтому отдельное правило: только порты Линейки, любые IP, параметры обмана — те же, что у игрового
+# правила выбранной стратегии (они под неё подобраны). Сайты и прочие игры правило не задевает.
+$script:L2DefaultPorts = '2106,7777'
+
+function Test-Lineage { Test-Path (Join-Path $script:Utils 'lineage.enabled') }
+
+function Get-LineagePorts {
+    $f = Join-Path $script:Utils 'lineage.ports'
+    try {
+        if (Test-Path -LiteralPath $f) {
+            $p = (Get-Content -LiteralPath $f -TotalCount 1 -ErrorAction Stop)
+            if ($p -and (Test-LineagePorts $p.Trim()).ok) { return $p.Trim() }
+        }
+    } catch {}
+    return $script:L2DefaultPorts
+}
+
+# Порты через запятую, диапазоны через дефис. 80/443 нельзя: на «любых IP» это весь веб — сломаются сайты
+function Test-LineagePorts([string]$text) {
+    $t = ($text -replace '\s', '').Trim(',')
+    if (-not $t) { return @{ ok = $false; err = 'Укажи хотя бы один порт, например 2106,7777' } }
+    if ($t -notmatch '^\d+(-\d+)?(,\d+(-\d+)?)*$') { return @{ ok = $false; err = 'Порты пишутся через запятую, диапазон через дефис: 2106,7777 или 7777-7779' } }
+    $norm = @()
+    foreach ($part in $t -split ',') {
+        $ab = @($part -split '-' | ForEach-Object { [int]$_ })
+        $a = $ab[0]; $b = $ab[-1]
+        if ($a -lt 1 -or $b -gt 65535 -or $a -gt $b) { return @{ ok = $false; err = "Неверный порт или диапазон: $part" } }
+        if ((80 -ge $a -and 80 -le $b) -or (443 -ge $a -and 443 -le $b)) {
+            return @{ ok = $false; err = 'Порты 80 и 443 добавлять нельзя — это весь веб, на любых IP сломаются сайты' }
+        }
+        if (($b - $a) -gt 1000) { return @{ ok = $false; err = "Слишком широкий диапазон: $part. Для всех игровых портов есть FACEIT MODE" } }
+        $norm += $part
+    }
+    if ($norm.Count -gt 20) { return @{ ok = $false; err = 'Не больше 20 портов или диапазонов' } }
+    return @{ ok = $true; ports = ($norm -join ',') }
+}
+
+# Добавляет к сырой строке аргументов (ещё с %GameFilterTCP%, %BIN%, %LISTS%) правило для портов Линейки
+function Add-LineageRule([string]$argStr, [string]$ports) {
+    if (-not $ports) { return $argStr }
+    # порты должен видеть сам перехват WinDivert, иначе правило не получит ни одного пакета
+    if ($argStr -match '--wf-tcp=(\S+)') {
+        $argStr = [regex]::Replace($argStr, '--wf-tcp=(\S+)', { param($m) '--wf-tcp=' + $m.Groups[1].Value + ',' + $ports }, 1)
+    } else {
+        $argStr = "--wf-tcp=$ports " + $argStr
+    }
+    # параметры берём у игрового TCP-правила стратегии
+    $params = $null
+    foreach ($seg in ($argStr -split '\s--new(\s|$)')) {
+        if ($seg -match '--filter-tcp=%GameFilterTCP%') { $params = $seg; break }
+    }
+    if ($params) {
+        $params = $params -replace '--filter-tcp=%GameFilterTCP%\s*', ''
+        $params = $params -replace '--ipset="[^"]*"\s*', ''          # любые IP (ipset-exclude остаётся)
+        $params = $params.Trim()
+    } else {
+        # у стратегии нет игрового правила — проверенный набор из FAKE TLS AUTO ALT3
+        $params = '--ipset-exclude="%LISTS%ipset-exclude.txt" --ipset-exclude="%LISTS%ipset-exclude-user.txt" ' +
+                  '--dpi-desync=fake,multisplit --dpi-desync-any-protocol=1 --dpi-desync-cutoff=n4 --dpi-desync-split-seqovl=681 ' +
+                  '--dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 ' +
+                  '--dpi-desync-split-seqovl-pattern="%BIN%tls_clienthello_www_google_com.bin" ' +
+                  '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com --dpi-desync-fake-unknown="%BIN%tls_clienthello_max_ru.bin"'
+    }
+    return ($argStr.TrimEnd() + " --new --filter-tcp=$ports " + $params)
+}
+
 function Get-StrategyArgs([string]$batFile) {
     $lines = Get-Content -LiteralPath $batFile
     $cmd = $null
@@ -316,6 +386,7 @@ function Get-StrategyArgs([string]$batFile) {
     $idx = $cmd.IndexOf($marker)
     if ($idx -lt 0) { throw "Не удалось выделить аргументы winws в: $batFile" }
     $argStr = $cmd.Substring($idx + $marker.Length).Trim()
+    if (Test-Lineage) { $argStr = Add-LineageRule $argStr (Get-LineagePorts) }
     $gf = Get-GameFilter
     $argStr = $argStr.Replace('%GameFilterTCP%', $gf.TCP)
     $argStr = $argStr.Replace('%GameFilterUDP%', $gf.UDP)
@@ -415,6 +486,7 @@ if ($TestParse) {
     $gf = Get-GameFilter
     Write-Host ("GameFilter: mode={0} TCP={1} UDP={2}" -f $gf.Mode, $gf.TCP, $gf.UDP)
     Write-Host ("IPSet: {0}" -f (Get-IpsetStatus))
+    Write-Host ("Lineage 2: {0}" -f $(if (Test-Lineage) { 'on, ports ' + (Get-LineagePorts) } else { 'off' }))
     Write-Host ("Punycode: {0}" -f (ConvertTo-Punycode 'президент.рф'))
     foreach ($f in Get-StrategyFiles) {
         $a = Get-StrategyArgs $f.FullName
@@ -625,6 +697,9 @@ function Install-ZapretSvc([string]$binPath, [string]$name) {
     return @{ ok=$true; err='' }
 }
 '@
+
+# Фоновые задачи (обновление zapret) собирают строку запуска сами — им нужна та же функция для Линейки
+$script:BgPrelude += "`nfunction Add-LineageRule {`n" + ${function:Add-LineageRule}.ToString() + "`n}`n"
 
 function Start-Bg {
     param(
@@ -1265,6 +1340,32 @@ $xaml = @'
 
                 <Border Style="{StaticResource Card}">
                   <StackPanel>
+                    <Grid>
+                      <StackPanel MaxWidth="560" HorizontalAlignment="Left">
+                        <TextBlock Text="И&#x2009;Г&#x2009;Р&#x2009;О&#x2009;В&#x2009;О&#x2009;Й&#x2009;&#x2009;Р&#x2009;Е&#x2009;Ж&#x2009;И&#x2009;М" Style="{StaticResource Kicker}"/>
+                        <TextBlock Text="Lineage 2" FontSize="18" FontWeight="SemiBold" Margin="0,10,0,0"/>
+                        <TextBlock Style="{StaticResource Muted}" FontSize="13" Margin="0,6,0,0"
+                                   Text="Обход для серверов Линейки на любых IP — только на её портах: вход 2106 и игра 7777. Сайты, браузер, OBS и другие игры не задевает."/>
+                      </StackPanel>
+                      <ToggleButton x:Name="TglLineage" Style="{StaticResource SwitchLg}" HorizontalAlignment="Right" VerticalAlignment="Top"
+                                    ToolTip="Добавляет в службу правило обхода для портов Lineage 2 на любых адресах. Работает и с официальными, и с приватными серверами."/>
+                    </Grid>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="170"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Grid.Column="0" Text="Порты" Foreground="{StaticResource TextMid}" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                      <TextBox x:Name="TxtL2Ports" Grid.Column="1" FontFamily="Consolas" FontSize="12.5" Padding="10,7"
+                               ToolTip="Через запятую, диапазон через дефис. У большинства серверов 2106 и 7777; если у твоего другие — впиши их (они есть в l2.ini или на сайте сервера)."/>
+                      <TextBlock x:Name="TxtL2Hint" Grid.Column="2" Text="Свои порты? Впиши и нажми Enter" Foreground="{StaticResource TextLow}" FontSize="12" VerticalAlignment="Center" Margin="12,0,0,0" TextWrapping="Wrap"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
                     <TextBlock Text="П&#x2009;А&#x2009;Р&#x2009;А&#x2009;М&#x2009;Е&#x2009;Т&#x2009;Р&#x2009;Ы" Style="{StaticResource Kicker}" Margin="0,0,0,6"/>
                     <Grid Margin="0,14,0,14">
                       <StackPanel VerticalAlignment="Center">
@@ -1548,6 +1649,7 @@ $ui = @{}
 foreach ($n in @('TitleBar','BtnMin','BtnClose','TxtRoot','PillService','DotService','TxtService','TglService','TxtStrategy',
                  'CmbStrategy','BtnInstall','BtnRemove','TxtWarn',
                  'DotWinws','TxtWinws','DotDivert','TxtDivert','TglFaceit','CmbGame','TxtIpset','BtnIpsetUpdate','TglUpd',
+                 'TglLineage','TxtL2Ports','TxtL2Hint',
                  'BtnRunTests','TestList','BtnAutoPick',
                  'TxtExclude','BtnSaveExclude','TxtGeneral','BtnSaveGeneral',
                  'TxtVerLocal','TxtVerLatest','BtnCheckUpd','BtnDoUpd','LnkTg','LnkGh','TxtVer','TxtGameSub',
@@ -1861,6 +1963,9 @@ function Update-Status {
         elseif ($wd)                           { $ui.DotDivert.Fill = $BrAmber; $ui.TxtDivert.Text = "WinDivert: $($wd.Status)" }
         else                                   { $ui.DotDivert.Fill = $BrGray;  $ui.TxtDivert.Text = 'WinDivert не активен' }
 
+        $ui.TglLineage.IsChecked = (Test-Lineage)
+        if (-not $ui.TxtL2Ports.IsKeyboardFocused -and -not $script:L2Dirty) { $ui.TxtL2Ports.Text = Get-LineagePorts }
+
         $faceit = Test-Faceit
         $ui.TglFaceit.IsChecked = $faceit
         # FACEIT MODE сам выставляет game filter = all; ручная смена в этот момент только ломала режим
@@ -2030,6 +2135,55 @@ $ui.TglFaceit.Add_Click({
     Update-Status
     Offer-Reinstall $(if ($on) { 'FACEIT режим включён.' } else { 'FACEIT режим выключен.' })
 })
+
+# ---------- Lineage 2 ----------
+$script:L2Dirty = $false
+
+function Set-Lineage([bool]$on) {
+    $flag = Join-Path $script:Utils 'lineage.enabled'
+    if ($on) { Set-Content -LiteralPath $flag -Value 'enabled' -Encoding ASCII }
+    elseif ([IO.File]::Exists($flag)) { [IO.File]::Delete($flag) }
+}
+
+# Сохраняет порты из поля; $true — если сохранились (или не менялись), $false — если ввод неверный
+function Save-LineagePorts {
+    $chk = Test-LineagePorts $ui.TxtL2Ports.Text
+    if (-not $chk.ok) {
+        $ui.TxtL2Hint.Text = $chk.err; $ui.TxtL2Hint.Foreground = $BrRedTx
+        return $false
+    }
+    $old = Get-LineagePorts
+    $ui.TxtL2Ports.Text = $chk.ports
+    $script:L2Dirty = $false
+    $ui.TxtL2Hint.Text = 'Свои порты? Впиши и нажми Enter'; $ui.TxtL2Hint.Foreground = $BrGray
+    if ($chk.ports -ne $old) {
+        Set-Content -LiteralPath (Join-Path $script:Utils 'lineage.ports') -Value $chk.ports -Encoding ASCII
+        Log "Lineage 2: порты $($chk.ports)"
+        if (Test-Lineage) { Offer-Reinstall 'Порты Lineage 2 изменены.' }
+    }
+    return $true
+}
+
+$ui.TglLineage.Add_Click({
+    $on = [bool]$ui.TglLineage.IsChecked
+    if ($on -and -not (Save-LineagePorts)) { $ui.TglLineage.IsChecked = $false; return }
+    Set-Lineage $on
+    if ($on) { Log "Lineage 2: обход включён (порты $(Get-LineagePorts), любые IP)" }
+    else     { Log 'Lineage 2: обход выключен' }
+    Update-Status
+    if ($on -and -not (Get-Service -Name zapret -ErrorAction SilentlyContinue)) {
+        Show-Info 'Lineage 2 включён' 'Осталось выбрать стратегию и нажать «Установить службу» — правило для Линейки встроится в неё.'
+        return
+    }
+    Offer-Reinstall $(if ($on) { 'Обход для Lineage 2 включён.' } else { 'Обход для Lineage 2 выключен.' })
+})
+
+$ui.TxtL2Ports.Add_TextChanged({ if ($ui.TxtL2Ports.IsKeyboardFocused) { $script:L2Dirty = $true } })
+$ui.TxtL2Ports.Add_KeyDown({
+    param($sender, $e)
+    if ($e.Key -eq 'Return') { [void](Save-LineagePorts); $e.Handled = $true }
+})
+$ui.TxtL2Ports.Add_LostKeyboardFocus({ if ($script:L2Dirty) { [void](Save-LineagePorts) } })
 
 $ui.CmbGame.Add_SelectionChanged({
     if ($script:updating) { return }
@@ -2364,7 +2518,7 @@ $ui.BtnReport.Add_Click({
     $svc = Get-Service -Name zapret -ErrorAction SilentlyContinue
     [void]$sb.AppendLine("Служба: $(if ($svc) { $svc.Status } else { 'не установлена' })")
     [void]$sb.AppendLine("Стратегия: $(Get-CurrentStrategy)")
-    [void]$sb.AppendLine("FACEIT: $(if (Test-Faceit) { 'вкл' } else { 'выкл' })   GameFilter: $((Get-GameFilter).Mode)   IPSet: $(Get-IpsetStatus)")
+    [void]$sb.AppendLine("FACEIT: $(if (Test-Faceit) { 'вкл' } else { 'выкл' })   Lineage 2: $(if (Test-Lineage) { 'вкл (' + (Get-LineagePorts) + ')' } else { 'выкл' })   GameFilter: $((Get-GameFilter).Mode)   IPSet: $(Get-IpsetStatus)")
     [void]$sb.AppendLine("winws.exe: $(if (Get-Process -Name winws -ErrorAction SilentlyContinue) { 'запущен' } else { 'не запущен' })")
     [void]$sb.AppendLine("Проверка доступа: $script:LastTestSummary")
     [void]$sb.AppendLine('')
@@ -2407,7 +2561,7 @@ $ui.BtnResetAll.Add_Click({
     $msg = "Уберу из системы всё, что добавлял zapret:`n" +
            "•  службу zapret и автозапуск`n" +
            "•  драйвер WinDivert и процесс winws.exe`n" +
-           "•  FACEIT MODE и игровой фильтр — выключу`n" +
+           "•  FACEIT MODE, Lineage 2 и игровой фильтр — выключу`n" +
            "•  сетевую настройку TCP timestamps — верну стандартную Windows`n`n" +
            "Обход перестанет работать. Папка zapret и твои списки сайтов останутся — если zapret больше не нужен, после этого просто удали папку."
     Show-Confirm 'Вернуть всё как было?' $msg 'Да, вернуть' $true {
@@ -2425,13 +2579,14 @@ else { BgLog ('TCP timestamps: стандарт Windows (' + $ts + ')') }
             param($res)
             $r = @($res)[-1]
             try { Set-Faceit $false } catch { Log "ОШИБКА: не удалось выключить FACEIT MODE: $($_.Exception.Message)" }
+            try { Set-Lineage $false } catch { Log "ОШИБКА: не удалось выключить Lineage 2: $($_.Exception.Message)" }
             Hide-Warn
             Update-Status
             Update-PickMarks
             if ($r -and $r.ok) {
                 Log 'Откат завершён'
                 $net = if ($r.ts -eq 'enabled') { '. Настройку TCP timestamps Windows поменять не дала — она безвредна, можно не обращать внимания.' } else { ', настройки сети стандартные.' }
-                Show-Info 'Готово — всё как было' ("Службы и драйвера zapret в системе больше нет, FACEIT MODE выключен" + $net + "`n`nЕсли zapret больше не нужен — удали папку с ним. Вернуть обход — вкладка Управление → «Установить службу».")
+                Show-Info 'Готово — всё как было' ("Службы и драйвера zapret в системе больше нет, FACEIT MODE и Lineage 2 выключены" + $net + "`n`nЕсли zapret больше не нужен — удали папку с ним. Вернуть обход — вкладка Управление → «Установить службу».")
             } elseif ($r -and $r.left) {
                 Log "Откат не до конца: осталось $($r.left)"
                 Show-Info 'Почти готово' "Не получилось убрать: $($r.left).`n`nОбычно Windows дочищает это после перезагрузки. Перезагрузи ПК и нажми кнопку ещё раз."
@@ -2656,7 +2811,8 @@ try {
     # переносим пользовательские файлы в новую версию
     $preserve = @(
         'lists\list-exclude-user.txt', 'lists\list-general-user.txt', 'lists\ipset-game.txt',
-        'lists\ipset-exclude-user.txt', 'utils\faceit.enabled', 'utils\game_filter.enabled', 'utils\check_updates.enabled'
+        'lists\ipset-exclude-user.txt', 'utils\faceit.enabled', 'utils\game_filter.enabled', 'utils\check_updates.enabled',
+        'utils\lineage.enabled', 'utils\lineage.ports'
     )
     foreach ($relPath in $preserve) {
         $s = Join-Path $CTX.root $relPath
@@ -2706,16 +2862,23 @@ try {
             }
             $marker = 'winws.exe"'
             $argStr = $cmd.Substring($cmd.IndexOf($marker) + $marker.Length).Trim()
+            if (Test-Path (Join-Path $CTX.root 'utils\lineage.enabled')) {
+                $l2p = '2106,7777'
+                $l2f = Join-Path $CTX.root 'utils\lineage.ports'
+                if (Test-Path $l2f) { $v = (Get-Content -LiteralPath $l2f -TotalCount 1); if ($v -and $v.Trim() -match '^\d+(-\d+)?(,\d+(-\d+)?)*$') { $l2p = $v.Trim() } }
+                $argStr = Add-LineageRule $argStr $l2p
+            }
             $gfFile = Join-Path $CTX.root 'utils\game_filter.enabled'
-            $gTcp = '12'; $gUdp = '12'
+            $gTcp = '12'; $gUdp = '12'; $gBoth = '12'
             if (Test-Path $gfFile) {
                 $mode = (Get-Content -LiteralPath $gfFile -TotalCount 1)
                 if ($mode) { $mode = $mode.Trim().ToLower() }
                 if ($mode -eq 'all') { $gTcp = '1024-65535'; $gUdp = '1024-65535' }
                 elseif ($mode -eq 'tcp') { $gTcp = '1024-65535' }
                 else { $gUdp = '1024-65535' }
+                $gBoth = '1024-65535'
             }
-            $argStr = $argStr.Replace('%GameFilterTCP%', $gTcp).Replace('%GameFilterUDP%', $gUdp).Replace('%GameFilter%', $gTcp)
+            $argStr = $argStr.Replace('%GameFilterTCP%', $gTcp).Replace('%GameFilterUDP%', $gUdp).Replace('%GameFilter%', $gBoth)
             $argStr = $argStr.Replace('%BIN%', (Join-Path $CTX.root 'bin\')).Replace('%LISTS%', (Join-Path $CTX.root 'lists\'))
             $binPath = ('"{0}" {1}' -f (Join-Path $CTX.root 'bin\winws.exe'), $argStr)
             $r = Install-ZapretSvc $binPath $CTX.strategy
