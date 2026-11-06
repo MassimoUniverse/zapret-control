@@ -9,6 +9,7 @@
 #       подсказки, DNS в диагностике, Esc/Enter в диалогах, память окна
 #  1.5: режим Lineage 2 — обход на портах Линейки для любых серверов
 #  1.6: вкладка «Соединения» — журнал, к каким адресам не удаётся подключиться
+#  1.7: Lineage 2 — режим «Не трогать» (порты Линейки мимо zapret) и поиск портов сервера
 # ============================================================
 param(
     [switch]$TestParse,
@@ -17,7 +18,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.6.0'
+$script:AppVersion = '1.7.0'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -306,7 +307,49 @@ function Get-StrategyFiles {
 # правила выбранной стратегии (они под неё подобраны). Сайты и прочие игры правило не задевает.
 $script:L2DefaultPorts = '2106,7777'
 
-function Test-Lineage { Test-Path (Join-Path $script:Utils 'lineage.enabled') }
+# Два режима, файл utils\lineage.enabled хранит какой:
+#   exclude — «Не трогать»: порты Линейки вычитаются из игрового диапазона, WinDivert их даже не перехватывает.
+#             Нужен, когда сервер НЕ заблокирован, а zapret (FACEIT MODE) своими ложными пакетами ломает
+#             соединение: по документации zapret, если сервер принимает фейк, «получается слом tcp соединения».
+#   bypass  — «Обход»: отдельное правило обмана DPI на портах Линейки (когда провайдер блокирует сервер).
+# Старое содержимое «enabled» (версия 1.5) = bypass.
+function Get-LineageMode {
+    $f = Join-Path $script:Utils 'lineage.enabled'
+    if (-not (Test-Path -LiteralPath $f)) { return 'off' }
+    $v = ''
+    try { $v = [string](Get-Content -LiteralPath $f -TotalCount 1 -ErrorAction Stop) } catch {}
+    if ($v.Trim() -eq 'exclude') { return 'exclude' }
+    return 'bypass'
+}
+function Test-Lineage { (Get-LineageMode) -ne 'off' }
+function Get-LineageModeText {
+    switch (Get-LineageMode) { 'exclude' { "не трогать ($(Get-LineagePorts))" } 'bypass' { "обход ($(Get-LineagePorts))" } default { 'выкл' } }
+}
+
+# Вычитает порты из списка диапазонов: ('1024-65535', '2106,7777') -> '1024-2105,2107-7776,7778-65535'.
+# Если вычитать нечего или игровой фильтр выключен (заглушка '12'), список не меняется.
+function Remove-PortsFromRange([string]$base, [string]$ports) {
+    if (-not $base -or -not $ports) { return $base }
+    $cut = @(foreach ($p in $ports -split ',') { if ($p -match '^(\d+)(?:-(\d+))?$') { ,@([int]$Matches[1], [int]$(if ($Matches[2]) { $Matches[2] } else { $Matches[1] })) } })
+    $res = New-Object System.Collections.ArrayList
+    foreach ($seg in $base -split ',') {
+        if ($seg -notmatch '^(\d+)(?:-(\d+))?$') { return $base }
+        $parts = New-Object System.Collections.ArrayList
+        [void]$parts.Add(@([int]$Matches[1], [int]$(if ($Matches[2]) { $Matches[2] } else { $Matches[1] })))
+        foreach ($c in $cut) {
+            $next = New-Object System.Collections.ArrayList
+            foreach ($p in $parts) {
+                if ($c[1] -lt $p[0] -or $c[0] -gt $p[1]) { [void]$next.Add($p); continue }
+                if ($c[0] -gt $p[0]) { [void]$next.Add(@($p[0], ($c[0] - 1))) }
+                if ($c[1] -lt $p[1]) { [void]$next.Add(@(($c[1] + 1), $p[1])) }
+            }
+            $parts = $next
+        }
+        foreach ($p in $parts) { [void]$res.Add($(if ($p[0] -eq $p[1]) { "$($p[0])" } else { "$($p[0])-$($p[1])" })) }
+    }
+    if (-not $res.Count) { return '12' }   # всё вычли — та же заглушка, что у выключенного фильтра
+    return ($res -join ',')
+}
 
 function Get-LineagePorts {
     $f = Join-Path $script:Utils 'lineage.ports'
@@ -387,9 +430,12 @@ function Get-StrategyArgs([string]$batFile) {
     $idx = $cmd.IndexOf($marker)
     if ($idx -lt 0) { throw "Не удалось выделить аргументы winws в: $batFile" }
     $argStr = $cmd.Substring($idx + $marker.Length).Trim()
-    if (Test-Lineage) { $argStr = Add-LineageRule $argStr (Get-LineagePorts) }
+    $l2mode = Get-LineageMode
+    if ($l2mode -eq 'bypass') { $argStr = Add-LineageRule $argStr (Get-LineagePorts) }
     $gf = Get-GameFilter
-    $argStr = $argStr.Replace('%GameFilterTCP%', $gf.TCP)
+    $gTcp = $gf.TCP
+    if ($l2mode -eq 'exclude') { $gTcp = Remove-PortsFromRange $gTcp (Get-LineagePorts) }
+    $argStr = $argStr.Replace('%GameFilterTCP%', $gTcp)
     $argStr = $argStr.Replace('%GameFilterUDP%', $gf.UDP)
     $argStr = $argStr.Replace('%GameFilter%',    $gf.Both)
     $argStr = $argStr.Replace('%BIN%',   $script:Bin)
@@ -487,7 +533,7 @@ if ($TestParse) {
     $gf = Get-GameFilter
     Write-Host ("GameFilter: mode={0} TCP={1} UDP={2}" -f $gf.Mode, $gf.TCP, $gf.UDP)
     Write-Host ("IPSet: {0}" -f (Get-IpsetStatus))
-    Write-Host ("Lineage 2: {0}" -f $(if (Test-Lineage) { 'on, ports ' + (Get-LineagePorts) } else { 'off' }))
+    Write-Host ("Lineage 2: {0}" -f (Get-LineageMode) + $(if (Test-Lineage) { ', ports ' + (Get-LineagePorts) } else { '' }))
     Write-Host ("Punycode: {0}" -f (ConvertTo-Punycode 'президент.рф'))
     foreach ($f in Get-StrategyFiles) {
         $a = Get-StrategyArgs $f.FullName
@@ -701,6 +747,7 @@ function Install-ZapretSvc([string]$binPath, [string]$name) {
 
 # Фоновые задачи (обновление zapret) собирают строку запуска сами — им нужна та же функция для Линейки
 $script:BgPrelude += "`nfunction Add-LineageRule {`n" + ${function:Add-LineageRule}.ToString() + "`n}`n"
+$script:BgPrelude += "`nfunction Remove-PortsFromRange {`n" + ${function:Remove-PortsFromRange}.ToString() + "`n}`n"
 
 function Start-Bg {
     param(
@@ -1345,22 +1392,29 @@ $xaml = @'
                       <StackPanel MaxWidth="560" HorizontalAlignment="Left">
                         <TextBlock Text="И&#x2009;Г&#x2009;Р&#x2009;О&#x2009;В&#x2009;О&#x2009;Й&#x2009;&#x2009;Р&#x2009;Е&#x2009;Ж&#x2009;И&#x2009;М" Style="{StaticResource Kicker}"/>
                         <TextBlock Text="Lineage 2" FontSize="18" FontWeight="SemiBold" Margin="0,10,0,0"/>
-                        <TextBlock Style="{StaticResource Muted}" FontSize="13" Margin="0,6,0,0"
-                                   Text="Обход для серверов Линейки на любых IP — только на её портах: вход 2106 и игра 7777. Сайты, браузер, OBS и другие игры не задевает."/>
+                        <TextBlock x:Name="TxtL2Desc" Style="{StaticResource Muted}" FontSize="13" Margin="0,6,0,0"
+                                   Text="Пишет «Связь с сервером прервалась»? Поставь «Не трогать»: zapret перестанет вмешиваться в соединение с сервером Линейки. «Обход» — только если провайдер блокирует сам сервер."/>
                       </StackPanel>
-                      <ToggleButton x:Name="TglLineage" Style="{StaticResource SwitchLg}" HorizontalAlignment="Right" VerticalAlignment="Top"
-                                    ToolTip="Добавляет в службу правило обхода для портов Lineage 2 на любых адресах. Работает и с официальными, и с приватными серверами."/>
+                      <ComboBox x:Name="CmbL2Mode" Width="200" Height="38" HorizontalAlignment="Right" VerticalAlignment="Top"
+                                ToolTip="Не трогать — порты Линейки вообще не проходят через zapret (лечит обрывы при включённом FACEIT MODE). Обход — отдельное правило обмана DPI на портах Линейки, если провайдер блокирует сервер.">
+                        <ComboBoxItem Content="Выключен"/>
+                        <ComboBoxItem Content="Не трогать"/>
+                        <ComboBoxItem Content="Обход блокировки"/>
+                      </ComboBox>
                     </Grid>
                     <Grid Margin="0,14,0,0">
                       <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="170"/>
+                        <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
                       </Grid.ColumnDefinitions>
                       <TextBlock Grid.Column="0" Text="Порты" Foreground="{StaticResource TextMid}" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,12,0"/>
                       <TextBox x:Name="TxtL2Ports" Grid.Column="1" FontFamily="Consolas" FontSize="12.5" Padding="10,7"
-                               ToolTip="Через запятую, диапазон через дефис. У большинства серверов 2106 и 7777; если у твоего другие — впиши их (они есть в l2.ini или на сайте сервера)."/>
-                      <TextBlock x:Name="TxtL2Hint" Grid.Column="2" Text="Свои порты? Впиши и нажми Enter" Foreground="{StaticResource TextLow}" FontSize="12" VerticalAlignment="Center" Margin="12,0,0,0" TextWrapping="Wrap"/>
+                               ToolTip="Через запятую, диапазон через дефис. У большинства серверов 2106 и 7777. Не знаешь свои — нажми «Найти порты» и зайди в игру."/>
+                      <Button x:Name="BtnL2Find" Grid.Column="2" Content="Найти порты" Padding="14,8" Margin="10,0,0,0"
+                              ToolTip="Минуту следит за соединениями клиента Линейки: запусти игру и попробуй войти — приложение само увидит адрес и порты сервера."/>
+                      <TextBlock x:Name="TxtL2Hint" Grid.Column="3" Text="Свои порты? Впиши и нажми Enter" Foreground="{StaticResource TextLow}" FontSize="12" VerticalAlignment="Center" Margin="12,0,0,0" TextWrapping="Wrap"/>
                     </Grid>
                   </StackPanel>
                 </Border>
@@ -1696,7 +1750,7 @@ $ui = @{}
 foreach ($n in @('TitleBar','BtnMin','BtnClose','TxtRoot','PillService','DotService','TxtService','TglService','TxtStrategy',
                  'CmbStrategy','BtnInstall','BtnRemove','TxtWarn',
                  'DotWinws','TxtWinws','DotDivert','TxtDivert','TglFaceit','CmbGame','TxtIpset','BtnIpsetUpdate','TglUpd',
-                 'TglLineage','TxtL2Ports','TxtL2Hint',
+                 'CmbL2Mode','TxtL2Ports','TxtL2Hint','BtnL2Find','TxtL2Desc',
                  'BtnRunTests','TestList','BtnAutoPick',
                  'TxtExclude','BtnSaveExclude','TxtGeneral','BtnSaveGeneral',
                  'TxtVerLocal','TxtVerLatest','BtnCheckUpd','BtnDoUpd','LnkTg','LnkGh','TxtVer','TxtGameSub',
@@ -2011,7 +2065,10 @@ function Update-Status {
         elseif ($wd)                           { $ui.DotDivert.Fill = $BrAmber; $ui.TxtDivert.Text = "WinDivert: $($wd.Status)" }
         else                                   { $ui.DotDivert.Fill = $BrGray;  $ui.TxtDivert.Text = 'WinDivert не активен' }
 
-        $ui.TglLineage.IsChecked = (Test-Lineage)
+        if (-not $ui.CmbL2Mode.IsDropDownOpen) {
+            $l2idx = switch (Get-LineageMode) { 'exclude' { 1 } 'bypass' { 2 } default { 0 } }
+            if ($ui.CmbL2Mode.SelectedIndex -ne $l2idx) { $ui.CmbL2Mode.SelectedIndex = $l2idx }
+        }
         if (-not $ui.TxtL2Ports.IsKeyboardFocused -and -not $script:L2Dirty) { $ui.TxtL2Ports.Text = Get-LineagePorts }
 
         $faceit = Test-Faceit
@@ -2187,11 +2244,12 @@ $ui.TglFaceit.Add_Click({
 # ---------- Lineage 2 ----------
 $script:L2Dirty = $false
 
-function Set-Lineage([bool]$on) {
+function Set-LineageMode([string]$mode) {
     $flag = Join-Path $script:Utils 'lineage.enabled'
-    if ($on) { Set-Content -LiteralPath $flag -Value 'enabled' -Encoding ASCII }
+    if ($mode -eq 'exclude' -or $mode -eq 'bypass') { Set-Content -LiteralPath $flag -Value $mode -Encoding ASCII }
     elseif ([IO.File]::Exists($flag)) { [IO.File]::Delete($flag) }
 }
+function Set-Lineage([bool]$on) { if (-not $on) { Set-LineageMode 'off' } else { Set-LineageMode 'bypass' } }
 
 # Сохраняет порты из поля; $true — если сохранились (или не менялись), $false — если ввод неверный
 function Save-LineagePorts {
@@ -2212,18 +2270,91 @@ function Save-LineagePorts {
     return $true
 }
 
-$ui.TglLineage.Add_Click({
-    $on = [bool]$ui.TglLineage.IsChecked
-    if ($on -and -not (Save-LineagePorts)) { $ui.TglLineage.IsChecked = $false; return }
-    Set-Lineage $on
-    if ($on) { Log "Lineage 2: обход включён (порты $(Get-LineagePorts), любые IP)" }
-    else     { Log 'Lineage 2: обход выключен' }
-    Update-Status
-    if ($on -and -not (Get-Service -Name zapret -ErrorAction SilentlyContinue)) {
-        Show-Info 'Lineage 2 включён' 'Осталось выбрать стратегию и нажать «Установить службу» — правило для Линейки встроится в неё.'
+$ui.CmbL2Mode.Add_SelectionChanged({
+    if ($script:updating) { return }
+    $mode = switch ($ui.CmbL2Mode.SelectedIndex) { 1 { 'exclude' } 2 { 'bypass' } default { 'off' } }
+    if ($mode -eq (Get-LineageMode)) { return }
+    if ($mode -ne 'off' -and -not (Save-LineagePorts)) {
+        $script:updating = $true
+        try { $ui.CmbL2Mode.SelectedIndex = switch (Get-LineageMode) { 'exclude' { 1 } 'bypass' { 2 } default { 0 } } } finally { $script:updating = $false }
         return
     }
-    Offer-Reinstall $(if ($on) { 'Обход для Lineage 2 включён.' } else { 'Обход для Lineage 2 выключен.' })
+    Set-LineageMode $mode
+    $what = switch ($mode) {
+        'exclude' { "Lineage 2: «Не трогать» — порты $(Get-LineagePorts) не проходят через zapret" }
+        'bypass'  { "Lineage 2: обход блокировки на портах $(Get-LineagePorts), любые IP" }
+        default   { 'Lineage 2: режим выключен' }
+    }
+    Log $what
+    if ($mode -eq 'exclude' -and -not (Test-Faceit) -and (Get-GameFilter).Mode -notin 'all', 'tcp') {
+        Log 'Lineage 2: FACEIT MODE и игровой TCP-фильтр выключены — zapret и так не трогал порты Линейки, режим заработает, когда они включатся'
+    }
+    Update-Status
+    if ($mode -ne 'off' -and -not (Get-Service -Name zapret -ErrorAction SilentlyContinue)) {
+        Show-Info 'Режим Lineage 2 сохранён' 'Осталось выбрать стратегию и нажать «Установить службу» — режим встроится в неё.'
+        return
+    }
+    Offer-Reinstall $(switch ($mode) { 'exclude' { 'Lineage 2: «Не трогать» включён.' } 'bypass' { 'Lineage 2: обход включён.' } default { 'Режим Lineage 2 выключен.' } })
+})
+
+# ---------- Lineage 2: поиск портов сервера ----------
+# Смотрим, куда подключается клиент Линейки, пока человек входит в игру. Порт 80/443 — это лаунчер и сайт, не игра.
+$script:L2ProcRegex = '^(?i)(l2|l2\.bin|lineage.*|la2.*|l2[a-z0-9_]*)$'
+$ui.BtnL2Find.Add_Click({
+    $ui.BtnL2Find.IsEnabled = $false
+    $ui.TxtL2Hint.Text = 'Жду минуту: запусти игру и попробуй войти...'; $ui.TxtL2Hint.Foreground = $BrAmber
+    Log 'Lineage 2: ищу порты сервера — запусти игру и попробуй войти (до 60 секунд)'
+    $ok = Start-Quiet -Params @{ typeSrc = $script:ConnTypeSrc; rx = $script:L2ProcRegex; seconds = 60 } -Body @'
+if (-not ('ZcTcpTable' -as [type])) { Add-Type -TypeDefinition $CTX.typeSrc -Language CSharp }
+$found = @{}; $names = @{}
+$end = (Get-Date).AddSeconds($CTX.seconds)
+$firstHit = $null
+while ((Get-Date) -lt $end) {
+    foreach ($r in [ZcTcpTable]::Read()) {
+        if ($r.Pid -le 4 -or $r.State -eq 2 -or $r.RemotePort -in 80, 443) { continue }
+        if ($r.Remote -like '127.*' -or $r.Remote -eq '::1' -or $r.Remote -eq '0.0.0.0' -or $r.Remote -eq '::') { continue }
+        if (-not $names.ContainsKey($r.Pid)) {
+            $n = ''
+            try { $n = [System.Diagnostics.Process]::GetProcessById($r.Pid).ProcessName } catch {}
+            $names[$r.Pid] = $n
+        }
+        $pn = $names[$r.Pid]
+        if (-not $pn -or $pn -notmatch $CTX.rx -or $pn -match '(?i)updat|launch|patch') { continue }
+        $k = "$($r.Remote):$($r.RemotePort)"
+        if (-not $found.ContainsKey($k)) {
+            $found[$k] = @{ proc = "$pn.exe"; remote = $r.Remote; port = $r.RemotePort; est = $false }
+            if (-not $firstHit) { $firstHit = Get-Date }
+        }
+        if ($r.State -eq 5) { $found[$k].est = $true }
+    }
+    # вход в игру — это два соединения (вход и игра); после первого ждём ещё 20 секунд и хватит
+    if ($firstHit -and ((Get-Date) - $firstHit).TotalSeconds -ge 20) { break }
+    Start-Sleep -Milliseconds 300
+}
+@{ found = @($found.Values) }
+'@ -OnDone {
+        param($res)
+        $ui.BtnL2Find.IsEnabled = $true
+        $r = @($res)[-1]
+        $list = @($r.found)
+        if (-not $list.Count) {
+            $ui.TxtL2Hint.Text = 'Клиент Линейки не подключался. Нажми ещё раз и сразу входи в игру'; $ui.TxtL2Hint.Foreground = $BrRedTx
+            Log 'Lineage 2: за минуту клиент игры ни к чему не подключился'
+            return
+        }
+        $ports = @($list | ForEach-Object { [int]$_.port } | Sort-Object -Unique)
+        $desc = ($list | ForEach-Object { "$($_.proc) → $($_.remote):$($_.port)$(if ($_.est) { '' } else { ' (не ответил)' })" }) -join ', '
+        Log "Lineage 2: найдено — $desc"
+        $ui.TxtL2Ports.Text = ($ports -join ',')
+        $script:L2Dirty = $true
+        if (Save-LineagePorts) {
+            $ui.TxtL2Hint.Text = "Найдено: $desc"; $ui.TxtL2Hint.Foreground = $BrGreenTx
+        }
+    }
+    if (-not $ok) {
+        $ui.BtnL2Find.IsEnabled = $true
+        $ui.TxtL2Hint.Text = 'Подожди пару секунд — идёт другая проверка'; $ui.TxtL2Hint.Foreground = $BrAmber
+    }
 })
 
 $ui.TxtL2Ports.Add_TextChanged({ if ($ui.TxtL2Ports.IsKeyboardFocused) { $script:L2Dirty = $true } })
@@ -2566,7 +2697,7 @@ $ui.BtnReport.Add_Click({
     $svc = Get-Service -Name zapret -ErrorAction SilentlyContinue
     [void]$sb.AppendLine("Служба: $(if ($svc) { $svc.Status } else { 'не установлена' })")
     [void]$sb.AppendLine("Стратегия: $(Get-CurrentStrategy)")
-    [void]$sb.AppendLine("FACEIT: $(if (Test-Faceit) { 'вкл' } else { 'выкл' })   Lineage 2: $(if (Test-Lineage) { 'вкл (' + (Get-LineagePorts) + ')' } else { 'выкл' })   GameFilter: $((Get-GameFilter).Mode)   IPSet: $(Get-IpsetStatus)")
+    [void]$sb.AppendLine("FACEIT: $(if (Test-Faceit) { 'вкл' } else { 'выкл' })   Lineage 2: $(Get-LineageModeText)   GameFilter: $((Get-GameFilter).Mode)   IPSet: $(Get-IpsetStatus)")
     [void]$sb.AppendLine("winws.exe: $(if (Get-Process -Name winws -ErrorAction SilentlyContinue) { 'запущен' } else { 'не запущен' })")
     [void]$sb.AppendLine("Проверка доступа: $script:LastTestSummary")
     [void]$sb.AppendLine('')
@@ -2917,11 +3048,14 @@ try {
             }
             $marker = 'winws.exe"'
             $argStr = $cmd.Substring($cmd.IndexOf($marker) + $marker.Length).Trim()
-            if (Test-Path (Join-Path $CTX.root 'utils\lineage.enabled')) {
-                $l2p = '2106,7777'
+            $l2mode = 'off'; $l2p = '2106,7777'
+            $l2flag = Join-Path $CTX.root 'utils\lineage.enabled'
+            if (Test-Path $l2flag) {
+                $l2v = [string](Get-Content -LiteralPath $l2flag -TotalCount 1)
+                $l2mode = if ($l2v.Trim() -eq 'exclude') { 'exclude' } else { 'bypass' }
                 $l2f = Join-Path $CTX.root 'utils\lineage.ports'
                 if (Test-Path $l2f) { $v = (Get-Content -LiteralPath $l2f -TotalCount 1); if ($v -and $v.Trim() -match '^\d+(-\d+)?(,\d+(-\d+)?)*$') { $l2p = $v.Trim() } }
-                $argStr = Add-LineageRule $argStr $l2p
+                if ($l2mode -eq 'bypass') { $argStr = Add-LineageRule $argStr $l2p }
             }
             $gfFile = Join-Path $CTX.root 'utils\game_filter.enabled'
             $gTcp = '12'; $gUdp = '12'; $gBoth = '12'
@@ -2933,6 +3067,7 @@ try {
                 else { $gUdp = '1024-65535' }
                 $gBoth = '1024-65535'
             }
+            if ($l2mode -eq 'exclude') { $gTcp = Remove-PortsFromRange $gTcp $l2p }
             $argStr = $argStr.Replace('%GameFilterTCP%', $gTcp).Replace('%GameFilterUDP%', $gUdp).Replace('%GameFilter%', $gBoth)
             $argStr = $argStr.Replace('%BIN%', (Join-Path $CTX.root 'bin\')).Replace('%LISTS%', (Join-Path $CTX.root 'lists\'))
             $binPath = ('"{0}" {1}' -f (Join-Path $CTX.root 'bin\winws.exe'), $argStr)
@@ -3304,7 +3439,7 @@ function Start-ConnMonitor {
             zapret   = $(if (Get-Process -Name winws -ErrorAction SilentlyContinue) { 'работал' } elseif ($svc) { "НЕ работал (служба: $($svc.Status))" } else { 'НЕ работал (служба не установлена)' })
             strategy = $(if (Get-CurrentStrategy) { Get-CurrentStrategy } else { '—' })
             faceit   = $(if (Test-Faceit) { 'вкл' } else { 'выкл' })
-            lineage  = $(if (Test-Lineage) { 'вкл (' + (Get-LineagePorts) + ')' } else { 'выкл' })
+            lineage  = (Get-LineageModeText)
         }
     })
     $rs = [runspacefactory]::CreateRunspace()
