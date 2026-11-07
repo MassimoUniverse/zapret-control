@@ -10,6 +10,7 @@
 #  1.5: режим Lineage 2 — обход на портах Линейки для любых серверов
 #  1.6: вкладка «Соединения» — журнал, к каким адресам не удаётся подключиться
 #  1.7: Lineage 2 — режим «Не трогать» (порты Линейки мимо zapret) и поиск портов сервера
+#  1.8: «Не трогать порты» — RustDesk/AnyDesk/TeamViewer и свои порты мимо FACEIT MODE
 # ============================================================
 param(
     [switch]$TestParse,
@@ -18,7 +19,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.7.0'
+$script:AppVersion = '1.8.0'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -411,6 +412,48 @@ function Add-LineageRule([string]$argStr, [string]$ports) {
     return ($argStr.TrimEnd() + " --new --filter-tcp=$ports " + $params)
 }
 
+# ---------- Не трогать порты ----------
+# FACEIT MODE подмешивает ложные пакеты во ВСЁ на портах 1024+ (TCP и UDP, любые IP). Программам со своим
+# протоколом это ломает связь: RustDesk пишет «Не подключено» — его UDP-регистрация на 21116 не доходит
+# (проверено: с исключённым IP сервер отвечает, без — молчит). Порты из utils\exclude.ports вычитаются
+# из игрового диапазона TCP и UDP, WinDivert их не перехватывает. Сайты и обычный обход это не задевает.
+$script:ExcludePresets = [ordered]@{
+    'RustDesk'   = '21115-21119'
+    'AnyDesk'    = '6568'
+    'TeamViewer' = '5938'
+}
+function Test-ExcludePorts([string]$text) {
+    $t = ($text -replace '\s', '').Trim(',')
+    if (-not $t) { return @{ ok = $true; ports = '' } }
+    if ($t -notmatch '^\d+(-\d+)?(,\d+(-\d+)?)*$') { return @{ ok = $false; err = 'Порты пишутся через запятую, диапазон через дефис: 21115-21119,5938' } }
+    $norm = New-Object System.Collections.ArrayList
+    foreach ($part in $t -split ',') {
+        $ab = @($part -split '-' | ForEach-Object { [int]$_ })
+        if ($ab[0] -lt 1 -or $ab[-1] -gt 65535 -or $ab[0] -gt $ab[-1]) { return @{ ok = $false; err = "Неверный порт или диапазон: $part" } }
+        if (-not $norm.Contains($part)) { [void]$norm.Add($part) }
+    }
+    if ($norm.Count -gt 30) { return @{ ok = $false; err = 'Не больше 30 портов или диапазонов' } }
+    return @{ ok = $true; ports = ($norm -join ',') }
+}
+function Get-ExcludePorts {
+    $f = Join-Path $script:Utils 'exclude.ports'
+    try {
+        if (Test-Path -LiteralPath $f) {
+            $p = [string](Get-Content -LiteralPath $f -TotalCount 1 -ErrorAction Stop)
+            $chk = Test-ExcludePorts $p
+            if ($chk.ok) { return $chk.ports }
+        }
+    } catch {}
+    return ''
+}
+function Get-ExcludeText {
+    $p = Get-ExcludePorts
+    if (-not $p) { return 'нет' }
+    $apps = @(foreach ($k in $script:ExcludePresets.Keys) { if ((",$p,") -like "*,$($script:ExcludePresets[$k]),*") { $k } })
+    if ($apps.Count) { return "$p ($($apps -join ', '))" }
+    return $p
+}
+
 function Get-StrategyArgs([string]$batFile) {
     $lines = Get-Content -LiteralPath $batFile
     $cmd = $null
@@ -435,9 +478,16 @@ function Get-StrategyArgs([string]$batFile) {
     $gf = Get-GameFilter
     $gTcp = $gf.TCP
     if ($l2mode -eq 'exclude') { $gTcp = Remove-PortsFromRange $gTcp (Get-LineagePorts) }
+    $gUdp = $gf.UDP; $gBoth = $gf.Both
+    $exP = Get-ExcludePorts
+    if ($exP) {
+        $gTcp  = Remove-PortsFromRange $gTcp  $exP
+        $gUdp  = Remove-PortsFromRange $gUdp  $exP
+        $gBoth = Remove-PortsFromRange $gBoth $exP
+    }
     $argStr = $argStr.Replace('%GameFilterTCP%', $gTcp)
-    $argStr = $argStr.Replace('%GameFilterUDP%', $gf.UDP)
-    $argStr = $argStr.Replace('%GameFilter%',    $gf.Both)
+    $argStr = $argStr.Replace('%GameFilterUDP%', $gUdp)
+    $argStr = $argStr.Replace('%GameFilter%',    $gBoth)
     $argStr = $argStr.Replace('%BIN%',   $script:Bin)
     $argStr = $argStr.Replace('%LISTS%', $script:Lists)
     return $argStr
@@ -534,6 +584,7 @@ if ($TestParse) {
     Write-Host ("GameFilter: mode={0} TCP={1} UDP={2}" -f $gf.Mode, $gf.TCP, $gf.UDP)
     Write-Host ("IPSet: {0}" -f (Get-IpsetStatus))
     Write-Host ("Lineage 2: {0}" -f (Get-LineageMode) + $(if (Test-Lineage) { ', ports ' + (Get-LineagePorts) } else { '' }))
+    Write-Host ("Exclude ports: {0}" -f (Get-ExcludeText))
     Write-Host ("Punycode: {0}" -f (ConvertTo-Punycode 'президент.рф'))
     foreach ($f in Get-StrategyFiles) {
         $a = Get-StrategyArgs $f.FullName
@@ -1421,6 +1472,33 @@ $xaml = @'
 
                 <Border Style="{StaticResource Card}">
                   <StackPanel>
+                    <StackPanel MaxWidth="600" HorizontalAlignment="Left">
+                      <TextBlock Text="И&#x2009;С&#x2009;К&#x2009;Л&#x2009;Ю&#x2009;Ч&#x2009;Е&#x2009;Н&#x2009;И&#x2009;Я" Style="{StaticResource Kicker}"/>
+                      <TextBlock Text="Не трогать порты" FontSize="18" FontWeight="SemiBold" Margin="0,10,0,0"/>
+                      <TextBlock Style="{StaticResource Muted}" FontSize="13" Margin="0,6,0,0"
+                                 Text="FACEIT MODE вмешивается во всё на портах 1024+. Некоторым программам это ломает связь — например, RustDesk пишет «Не подключено». Порты отсюда zapret пропускает как есть, сайты и обход это не задевает."/>
+                    </StackPanel>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*" MaxWidth="260"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Grid.Column="0" Text="Порты" Foreground="{StaticResource TextMid}" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                      <TextBox x:Name="TxtExPorts" Grid.Column="1" FontFamily="Consolas" FontSize="12.5" Padding="10,7"
+                               ToolTip="Через запятую, диапазон через дефис. Действует на TCP и UDP. Пусто — ничего не исключено."/>
+                      <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="10,0,0,0">
+                        <Button x:Name="BtnExRustDesk" Content="+ RustDesk" Padding="12,8" ToolTip="Порты сервера RustDesk: 21115–21119"/>
+                        <Button x:Name="BtnExAnyDesk" Content="+ AnyDesk" Padding="12,8" Margin="6,0,0,0" ToolTip="Порт AnyDesk: 6568"/>
+                        <Button x:Name="BtnExTeamViewer" Content="+ TeamViewer" Padding="12,8" Margin="6,0,0,0" ToolTip="Порт TeamViewer: 5938"/>
+                      </StackPanel>
+                    </Grid>
+                    <TextBlock x:Name="TxtExHint" Text="Свои порты? Впиши и нажми Enter. Работает, когда включён FACEIT MODE или игровой фильтр" Foreground="{StaticResource TextLow}" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
                     <TextBlock Text="П&#x2009;А&#x2009;Р&#x2009;А&#x2009;М&#x2009;Е&#x2009;Т&#x2009;Р&#x2009;Ы" Style="{StaticResource Kicker}" Margin="0,0,0,6"/>
                     <Grid Margin="0,14,0,14">
                       <StackPanel VerticalAlignment="Center">
@@ -1751,6 +1829,7 @@ foreach ($n in @('TitleBar','BtnMin','BtnClose','TxtRoot','PillService','DotServ
                  'CmbStrategy','BtnInstall','BtnRemove','TxtWarn',
                  'DotWinws','TxtWinws','DotDivert','TxtDivert','TglFaceit','CmbGame','TxtIpset','BtnIpsetUpdate','TglUpd',
                  'CmbL2Mode','TxtL2Ports','TxtL2Hint','BtnL2Find','TxtL2Desc',
+                 'TxtExPorts','BtnExRustDesk','BtnExAnyDesk','BtnExTeamViewer','TxtExHint',
                  'BtnRunTests','TestList','BtnAutoPick',
                  'TxtExclude','BtnSaveExclude','TxtGeneral','BtnSaveGeneral',
                  'TxtVerLocal','TxtVerLatest','BtnCheckUpd','BtnDoUpd','LnkTg','LnkGh','TxtVer','TxtGameSub',
@@ -2070,6 +2149,7 @@ function Update-Status {
             if ($ui.CmbL2Mode.SelectedIndex -ne $l2idx) { $ui.CmbL2Mode.SelectedIndex = $l2idx }
         }
         if (-not $ui.TxtL2Ports.IsKeyboardFocused -and -not $script:L2Dirty) { $ui.TxtL2Ports.Text = Get-LineagePorts }
+        if (-not $ui.TxtExPorts.IsKeyboardFocused -and -not $script:ExDirty) { $ui.TxtExPorts.Text = Get-ExcludePorts }
 
         $faceit = Test-Faceit
         $ui.TglFaceit.IsChecked = $faceit
@@ -2363,6 +2443,61 @@ $ui.TxtL2Ports.Add_KeyDown({
     if ($e.Key -eq 'Return') { [void](Save-LineagePorts); $e.Handled = $true }
 })
 $ui.TxtL2Ports.Add_LostKeyboardFocus({ if ($script:L2Dirty) { [void](Save-LineagePorts) } })
+
+# ---------- Не трогать порты ----------
+$script:ExDirty = $false
+$script:ExHintDefault = 'Свои порты? Впиши и нажми Enter. Работает, когда включён FACEIT MODE или игровой фильтр'
+
+function Save-ExcludePorts {
+    $chk = Test-ExcludePorts $ui.TxtExPorts.Text
+    if (-not $chk.ok) {
+        $ui.TxtExHint.Text = $chk.err; $ui.TxtExHint.Foreground = $BrRedTx
+        return $false
+    }
+    $old = Get-ExcludePorts
+    $ui.TxtExPorts.Text = $chk.ports
+    $script:ExDirty = $false
+    if ($chk.ports -eq $old) {
+        $ui.TxtExHint.Text = $script:ExHintDefault; $ui.TxtExHint.Foreground = $BrGray
+        return $true
+    }
+    $f = Join-Path $script:Utils 'exclude.ports'
+    if ($chk.ports) { Set-Content -LiteralPath $f -Value $chk.ports -Encoding ASCII }
+    elseif ([IO.File]::Exists($f)) { [IO.File]::Delete($f) }
+    $txt = Get-ExcludeText
+    Log $(if ($chk.ports) { "Не трогать порты: $txt" } else { 'Не трогать порты: список очищен' })
+    $gm = (Get-GameFilter).Mode
+    if ($gm -eq 'off') {
+        $ui.TxtExHint.Text = 'Сохранено. Сейчас FACEIT MODE и игровой фильтр выключены — zapret эти порты и так не трогает'
+        $ui.TxtExHint.Foreground = $BrGray
+        return $true
+    }
+    $ui.TxtExHint.Text = $(if ($chk.ports) { "Сохранено: $txt" } else { 'Список очищен' }); $ui.TxtExHint.Foreground = $BrGreenTx
+    if (Get-Service -Name zapret -ErrorAction SilentlyContinue) { Offer-Reinstall 'Список «Не трогать порты» изменён.' }
+    return $true
+}
+
+function Add-ExcludePreset([string]$name) {
+    $ports = $script:ExcludePresets[$name]
+    $cur = Test-ExcludePorts $ui.TxtExPorts.Text
+    $list = @(if ($cur.ok -and $cur.ports) { $cur.ports -split ',' })
+    if ($list -contains $ports) {
+        $ui.TxtExHint.Text = "$name уже в списке ($ports)"; $ui.TxtExHint.Foreground = $BrGray
+        return
+    }
+    $ui.TxtExPorts.Text = (@($list) + $ports) -join ','
+    $script:ExDirty = $true
+    [void](Save-ExcludePorts)
+}
+$ui.BtnExRustDesk.Add_Click({ Add-ExcludePreset 'RustDesk' })
+$ui.BtnExAnyDesk.Add_Click({ Add-ExcludePreset 'AnyDesk' })
+$ui.BtnExTeamViewer.Add_Click({ Add-ExcludePreset 'TeamViewer' })
+$ui.TxtExPorts.Add_TextChanged({ if ($ui.TxtExPorts.IsKeyboardFocused) { $script:ExDirty = $true } })
+$ui.TxtExPorts.Add_KeyDown({
+    param($sender, $e)
+    if ($e.Key -eq 'Return') { [void](Save-ExcludePorts); $e.Handled = $true }
+})
+$ui.TxtExPorts.Add_LostKeyboardFocus({ if ($script:ExDirty) { [void](Save-ExcludePorts) } })
 
 $ui.CmbGame.Add_SelectionChanged({
     if ($script:updating) { return }
@@ -2697,7 +2832,7 @@ $ui.BtnReport.Add_Click({
     $svc = Get-Service -Name zapret -ErrorAction SilentlyContinue
     [void]$sb.AppendLine("Служба: $(if ($svc) { $svc.Status } else { 'не установлена' })")
     [void]$sb.AppendLine("Стратегия: $(Get-CurrentStrategy)")
-    [void]$sb.AppendLine("FACEIT: $(if (Test-Faceit) { 'вкл' } else { 'выкл' })   Lineage 2: $(Get-LineageModeText)   GameFilter: $((Get-GameFilter).Mode)   IPSet: $(Get-IpsetStatus)")
+    [void]$sb.AppendLine("FACEIT: $(if (Test-Faceit) { 'вкл' } else { 'выкл' })   Lineage 2: $(Get-LineageModeText)   Не трогать порты: $(Get-ExcludeText)   GameFilter: $((Get-GameFilter).Mode)   IPSet: $(Get-IpsetStatus)")
     [void]$sb.AppendLine("winws.exe: $(if (Get-Process -Name winws -ErrorAction SilentlyContinue) { 'запущен' } else { 'не запущен' })")
     [void]$sb.AppendLine("Проверка доступа: $script:LastTestSummary")
     [void]$sb.AppendLine('')
@@ -2998,7 +3133,7 @@ try {
     $preserve = @(
         'lists\list-exclude-user.txt', 'lists\list-general-user.txt', 'lists\ipset-game.txt',
         'lists\ipset-exclude-user.txt', 'utils\faceit.enabled', 'utils\game_filter.enabled', 'utils\check_updates.enabled',
-        'utils\lineage.enabled', 'utils\lineage.ports'
+        'utils\lineage.enabled', 'utils\lineage.ports', 'utils\exclude.ports'
     )
     foreach ($relPath in $preserve) {
         $s = Join-Path $CTX.root $relPath
@@ -3068,6 +3203,13 @@ try {
                 $gBoth = '1024-65535'
             }
             if ($l2mode -eq 'exclude') { $gTcp = Remove-PortsFromRange $gTcp $l2p }
+            $exF = Join-Path $CTX.root 'utils\exclude.ports'
+            if (Test-Path $exF) {
+                $exP = ([string](Get-Content -LiteralPath $exF -TotalCount 1)).Trim()
+                if ($exP -match '^\d+(-\d+)?(,\d+(-\d+)?)*$') {
+                    $gTcp = Remove-PortsFromRange $gTcp $exP; $gUdp = Remove-PortsFromRange $gUdp $exP; $gBoth = Remove-PortsFromRange $gBoth $exP
+                }
+            }
             $argStr = $argStr.Replace('%GameFilterTCP%', $gTcp).Replace('%GameFilterUDP%', $gUdp).Replace('%GameFilter%', $gBoth)
             $argStr = $argStr.Replace('%BIN%', (Join-Path $CTX.root 'bin\')).Replace('%LISTS%', (Join-Path $CTX.root 'lists\'))
             $binPath = ('"{0}" {1}' -f (Join-Path $CTX.root 'bin\winws.exe'), $argStr)
@@ -3403,7 +3545,7 @@ function Get-ConnReportText([bool]$timeline) {
     $end = if ($m.ended) { $m.ended } else { Get-Date }
     [void]$sb.AppendLine("=== Zapret Control $script:AppVersion — журнал соединений ===")
     [void]$sb.AppendLine("Запись: $($m.started.ToString('yyyy-MM-dd HH:mm:ss')) – $($end.ToString('HH:mm:ss')) ($(Format-Duration ($end - $m.started)))$(if ($m.autostop) { ', остановлена автоматически через 15 минут' })")
-    [void]$sb.AppendLine("Во время записи: zapret $($m.ctx.zapret) · стратегия: $($m.ctx.strategy) · FACEIT: $($m.ctx.faceit) · Lineage 2: $($m.ctx.lineage)")
+    [void]$sb.AppendLine("Во время записи: zapret $($m.ctx.zapret) · стратегия: $($m.ctx.strategy) · FACEIT: $($m.ctx.faceit) · Lineage 2: $($m.ctx.lineage) · не трогать порты: $($m.ctx.exclude)")
     [void]$sb.AppendLine("Соединений: $($m.total) · адресов: $(@($m.snap).Count)")
     [void]$sb.AppendLine('Видны только TCP-соединения: голос Discord и игры на UDP так не отследить.')
     $all = Get-ConnSorted
@@ -3440,6 +3582,7 @@ function Start-ConnMonitor {
             strategy = $(if (Get-CurrentStrategy) { Get-CurrentStrategy } else { '—' })
             faceit   = $(if (Test-Faceit) { 'вкл' } else { 'выкл' })
             lineage  = (Get-LineageModeText)
+            exclude  = (Get-ExcludeText)
         }
     })
     $rs = [runspacefactory]::CreateRunspace()
