@@ -13,6 +13,7 @@
 #  1.8: «Не трогать порты» — RustDesk/AnyDesk/TeamViewer и свои порты мимо FACEIT MODE
 #  1.9: Линейка вынесена в отдельный L2 Helper (исключает IP серверов игры), из Control убрана
 #  1.9.1: служба не падает на стратегиях с ^ в .bat (general (FAKE TLS AUTO): fake-tls=^!)
+#  1.9.2: служба ждёт BFE при загрузке и сама перезапускается при сбое
 # ============================================================
 param(
     [switch]$TestParse,
@@ -21,7 +22,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.9.1'
+$script:AppVersion = '1.9.2'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -707,11 +708,15 @@ function Install-ZapretSvc([string]$binPath, [string]$name) {
     $created = $false
     for ($i = 0; $i -lt 6 -and -not $created; $i++) {
         try {
-            New-Service -Name zapret -BinaryPathName $binPath -DisplayName 'zapret' -Description 'Zapret DPI bypass software' -StartupType Automatic -ErrorAction Stop | Out-Null
+            # DependsOn BFE: WinDivert работает через Base Filtering Engine. Без зависимости на медленном ПК
+            # служба при загрузке стартовала раньше BFE, winws не открывал драйвер и закрывался (7034, «неожиданно прервана»)
+            New-Service -Name zapret -BinaryPathName $binPath -DisplayName 'zapret' -Description 'Zapret DPI bypass software' -StartupType Automatic -DependsOn 'BFE' -ErrorAction Stop | Out-Null
             $created = $true
         } catch { Start-Sleep -Milliseconds 600 }
     }
     if (-not $created) { return @{ ok=$false; err='не удалось создать службу (старая помечена на удаление)' } }
+    # если всё же упала (сеть ещё не поднялась, драйвер занят) — Windows сама перезапустит её через 5 / 15 / 60 секунд
+    & sc.exe failure zapret reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Out-Null
     try { Start-Service -Name zapret -ErrorAction Stop }
     catch {
         $reason = Get-SvcFailReason
