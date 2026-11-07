@@ -9,6 +9,7 @@
 #       открывается только на «узнать путь» — без доступа к памяти (античит)
 #  1.2: кнопка «Проверить обновления» — сам качает L2-Helper.zip из релиза (через API, без кэша CDN)
 #       и подменяет себя, без копии рядом
+#  1.3: ловит и лаунчер/античит проекта (Active Launcher и т.п.) — любую программу из папки игры
 # ============================================================
 param(
     [switch]$TestUI,
@@ -17,7 +18,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.2.0'
+$script:Version = '1.3.0'
 # Через API: прямая ссылка latest/download кэшируется GitHub'ом и минутами отдаёт старый архив,
 # а у ссылки на ассет по id после каждой загрузки новый адрес. L2H_UPD_URL — прямой адрес архива (для тестов).
 $script:UpdApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
@@ -144,8 +145,34 @@ function Remove-FromExcl([string[]]$ips) {
 # ---------- Кто клиент Линейки ----------
 # Проекты называют клиент как угодно, но папка system у всех от одного движка:
 # NWindow.dll (интерфейс L2), l2.ini, либо Engine.dll + Core.dll. Плюс запасной вариант по имени.
-$script:NameRx = '^(?i)(l2|l2\.bin|l2\.exe\.bin|lineage.*|la2.*)$'
+# Лаунчер и античит проекта (Active Launcher и т.п.) лежат не в system, а в корне игры или рядом —
+# поэтому смотрим папку программы и до двух уровней вверх: есть ли там (или в её system) файлы движка.
+$script:NameRx = '^(?i)(l2|l2\.bin|l2\.exe\.bin|lineage.*|la2.*|active.*(launch|anti|cheat|guard).*|aac.*)$'
 $script:PidCache = @{}
+$script:DirCache = @{}
+function Test-L2Folder([string]$d) {
+    foreach ($x in @($d, (Join-Path $d 'system'))) {
+        if ((Test-Path -LiteralPath (Join-Path $x 'NWindow.dll')) -or (Test-Path -LiteralPath (Join-Path $x 'l2.ini')) -or
+            ((Test-Path -LiteralPath (Join-Path $x 'Engine.dll')) -and (Test-Path -LiteralPath (Join-Path $x 'Core.dll')))) { return $true }
+    }
+    return $false
+}
+# Возвращает имя папки проекта (LA2BEST и т.п.), если программа лежит внутри папки игры; иначе $null
+function Find-L2Project([string]$exeDir) {
+    if ($script:DirCache.ContainsKey($exeDir)) { return $script:DirCache[$exeDir] }
+    $res = $null
+    $d = $exeDir
+    for ($i = 0; $i -lt 3 -and $d; $i++) {
+        if ((Split-Path $d -Parent) -and (Test-L2Folder $d)) {
+            $leaf = Split-Path $d -Leaf
+            $res = if ($leaf -match '^(?i)system') { Split-Path (Split-Path $d -Parent) -Leaf } else { $leaf }
+            break
+        }
+        $d = Split-Path $d -Parent
+    }
+    $script:DirCache[$exeDir] = $res
+    return $res
+}
 function Get-L2Info([int]$procId) {
     if ($script:PidCache.ContainsKey($procId)) { return $script:PidCache[$procId] }
     $info = $null
@@ -157,12 +184,8 @@ function Get-L2Info([int]$procId) {
         $path = [L2hProc]::GetPath($procId)
         $isL2 = $false; $project = ''
         if ($path) {
-            $dir = Split-Path $path -Parent
-            if ((Test-Path (Join-Path $dir 'NWindow.dll')) -or (Test-Path (Join-Path $dir 'l2.ini')) -or
-                ((Test-Path (Join-Path $dir 'Engine.dll')) -and (Test-Path (Join-Path $dir 'Core.dll')))) { $isL2 = $true }
-            $proj = Split-Path $dir -Leaf
-            if ($proj -match '^(?i)system') { $proj = Split-Path (Split-Path $dir -Parent) -Leaf }
-            $project = $proj
+            $proj = Find-L2Project (Split-Path $path -Parent)
+            if ($proj) { $isL2 = $true; $project = $proj }
         }
         if (-not $isL2 -and $name -match $script:NameRx) { $isL2 = $true }
         if ($isL2) { $info = @{ name = "$name.exe"; project = $project; path = $path } }
