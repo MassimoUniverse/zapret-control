@@ -7,7 +7,8 @@
 #  Исключения остаются в файле — после перезагрузки ничего искать не нужно.
 #  1.1: работа в трее, автозапуск с Windows (задача планировщика), процесс игры
 #       открывается только на «узнать путь» — без доступа к памяти (античит)
-#  1.2: кнопка «Проверить обновления» — сам качает L2-Helper.zip из релиза и обновляется
+#  1.2: кнопка «Проверить обновления» — сам качает L2-Helper.zip из релиза (через API, без кэша CDN)
+#       и подменяет себя, без копии рядом
 # ============================================================
 param(
     [switch]$TestUI,
@@ -17,7 +18,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $script:Version = '1.2.0'
-$script:UpdUrl = if ($env:L2H_UPD_URL) { $env:L2H_UPD_URL } else { 'https://github.com/MassimoUniverse/zapret-control/releases/latest/download/L2-Helper.zip' }
+# Через API: прямая ссылка latest/download кэшируется GitHub'ом и минутами отдаёт старый архив,
+# а у ссылки на ассет по id после каждой загрузки новый адрес. L2H_UPD_URL — прямой адрес архива (для тестов).
+$script:UpdApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
+$script:UpdUrl = if ($env:L2H_UPD_URL) { $env:L2H_UPD_URL } else { '' }
 $script:AppDir = if ($PSScriptRoot) { $PSScriptRoot } else { [AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
 $script:TaskName = if ($env:L2H_TASK_NAME) { $env:L2H_TASK_NAME } else { 'L2 Helper' }
 
@@ -690,13 +694,22 @@ $ui.ChkAuto.Add_Unchecked({ Toggle-Auto $false })
 # Берём тот же архив, что раздаётся людям: L2-Helper.zip из последнего релиза. Он маленький (~10 КБ),
 # поэтому версию узнаём, просто скачав его. Качаем в фоне, чтобы окно не подвисало.
 $script:UpdBody = {
-    param($url)
+    param($url, $api)
     $tmp = Join-Path $env:TEMP ('l2h_upd_' + [Guid]::NewGuid().ToString('N'))
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         $zip = Join-Path $tmp 'u.zip'
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 40
+        $hdr = @{ 'User-Agent' = 'L2Helper' }
+        if ($url) {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 40 -Headers $hdr
+        } else {
+            $rel = Invoke-RestMethod -Uri $api -UseBasicParsing -TimeoutSec 30 -Headers $hdr
+            $asset = @($rel.assets) | Where-Object { $_.name -eq 'L2-Helper.zip' } | Select-Object -First 1
+            if (-not $asset) { throw "в последнем релизе ($($rel.tag_name)) нет L2-Helper.zip" }
+            $hdr['Accept'] = 'application/octet-stream'
+            Invoke-WebRequest -Uri $asset.url -OutFile $zip -UseBasicParsing -TimeoutSec 40 -Headers $hdr
+        }
         Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $tmp 'x') -Force
         $ps1 = Get-ChildItem (Join-Path $tmp 'x') -Recurse -Filter 'L2Helper.ps1' | Select-Object -First 1
         if (-not $ps1) { throw 'в архиве нет L2Helper.ps1' }
@@ -731,7 +744,7 @@ function Start-UpdCheck([bool]$quiet) {
     $script:UpdQuiet = $quiet
     $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
     $script:UpdPs = [powershell]::Create(); $script:UpdPs.Runspace = $rs
-    [void]$script:UpdPs.AddScript($script:UpdBody).AddArgument($script:UpdUrl)
+    [void]$script:UpdPs.AddScript($script:UpdBody).AddArgument($script:UpdUrl).AddArgument($script:UpdApi)
     $script:UpdHandle = $script:UpdPs.BeginInvoke()
     if (-not $quiet) { Log 'Проверяю обновления L2 Helper...' }
     Set-UpdButton
@@ -761,8 +774,10 @@ function Install-Update {
     # PowerShell 5.1 читает файл без BOM как ANSI — русский текст сломается; BOM ставим, если его нет
     if (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) { $bytes = [byte[]](@(0xEF, 0xBB, 0xBF) + $bytes) }
     try {
-        Copy-Item -LiteralPath $script:SelfPath -Destination ($script:SelfPath + '.bak') -Force
-        [IO.File]::WriteAllBytes($script:SelfPath, $bytes)
+        # без копии рядом: пишем во временный файл и подменяем им старый одним переносом
+        $new = $script:SelfPath + '.new'
+        [IO.File]::WriteAllBytes($new, $bytes)
+        Move-Item -LiteralPath $new -Destination $script:SelfPath -Force
         if ($u.bat) { [IO.File]::WriteAllBytes((Join-Path (Split-Path $script:SelfPath -Parent) 'L2 Helper.bat'), [byte[]]$u.bat) }
     } catch {
         Log "ОШИБКА обновления: $($_.Exception.Message)"
