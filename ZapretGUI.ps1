@@ -12,6 +12,7 @@
 #  1.7: Lineage 2 — режим «Не трогать» (порты Линейки мимо zapret) и поиск портов сервера
 #  1.8: «Не трогать порты» — RustDesk/AnyDesk/TeamViewer и свои порты мимо FACEIT MODE
 #  1.9: Линейка вынесена в отдельный L2 Helper (исключает IP серверов игры), из Control убрана
+#  1.9.1: служба не падает на стратегиях с ^ в .bat (general (FAKE TLS AUTO): fake-tls=^!)
 # ============================================================
 param(
     [switch]$TestParse,
@@ -20,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.9.0'
+$script:AppVersion = '1.9.1'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -369,6 +370,22 @@ function Get-ExcludeText {
     return $p
 }
 
+# В .bat знак ^ экранирует следующий символ, и cmd его убирает: --dpi-desync-fake-tls=^! доходит до winws как «!»
+# (встроенный образец). В службу строка идёт мимо cmd — без этой функции winws получал «^!», искал такой файл
+# и сразу закрывался (служба «неожиданно прервана», код 1067). Внутри кавычек cmd ^ не трогает — мы тоже.
+function Remove-BatCarets([string]$s) {
+    if ($s.IndexOf('^') -lt 0) { return $s }
+    $sb = New-Object System.Text.StringBuilder
+    $inQ = $false
+    for ($i = 0; $i -lt $s.Length; $i++) {
+        $c = $s[$i]
+        if ($c -eq '"') { $inQ = -not $inQ; [void]$sb.Append($c); continue }
+        if ($c -eq '^' -and -not $inQ -and $i + 1 -lt $s.Length) { $i++; [void]$sb.Append($s[$i]); continue }
+        [void]$sb.Append($c)
+    }
+    return $sb.ToString()
+}
+
 function Get-StrategyArgs([string]$batFile) {
     $lines = Get-Content -LiteralPath $batFile
     $cmd = $null
@@ -387,7 +404,7 @@ function Get-StrategyArgs([string]$batFile) {
     $marker = 'winws.exe"'
     $idx = $cmd.IndexOf($marker)
     if ($idx -lt 0) { throw "Не удалось выделить аргументы winws в: $batFile" }
-    $argStr = $cmd.Substring($idx + $marker.Length).Trim()
+    $argStr = Remove-BatCarets ($cmd.Substring($idx + $marker.Length).Trim())
     $gf = Get-GameFilter
     $gTcp = $gf.TCP
     $gUdp = $gf.UDP; $gBoth = $gf.Both
@@ -708,6 +725,7 @@ function Install-ZapretSvc([string]$binPath, [string]$name) {
 '@
 
 $script:BgPrelude += "`nfunction Remove-PortsFromRange {`n" + ${function:Remove-PortsFromRange}.ToString() + "`n}`n"
+$script:BgPrelude += "`nfunction Remove-BatCarets {`n" + ${function:Remove-BatCarets}.ToString() + "`n}`n"
 
 function Start-Bg {
     param(
@@ -2928,7 +2946,7 @@ try {
                 }
             }
             $marker = 'winws.exe"'
-            $argStr = $cmd.Substring($cmd.IndexOf($marker) + $marker.Length).Trim()
+            $argStr = Remove-BatCarets ($cmd.Substring($cmd.IndexOf($marker) + $marker.Length).Trim())
             $gfFile = Join-Path $CTX.root 'utils\game_filter.enabled'
             $gTcp = '12'; $gUdp = '12'; $gBoth = '12'
             if (Test-Path $gfFile) {
