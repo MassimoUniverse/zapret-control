@@ -5,33 +5,41 @@
 #  IP серверов в lists\ipset-exclude-user.txt — zapret перечитывает список
 #  на лету и перестаёт вмешиваться в эти соединения (в т.ч. FACEIT MODE).
 #  Исключения остаются в файле — после перезагрузки ничего искать не нужно.
+#  1.1: работа в трее, автозапуск с Windows (задача планировщика), процесс игры
+#       открывается только на «узнать путь» — без доступа к памяти (античит)
 # ============================================================
 param(
     [switch]$TestUI,
+    [switch]$Tray,
     [string]$RootOverride
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.0.0'
+$script:Version = '1.1.0'
 $script:AppDir = if ($PSScriptRoot) { $PSScriptRoot } else { [AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
+$script:TaskName = if ($env:L2H_TASK_NAME) { $env:L2H_TASK_NAME } else { 'L2 Helper' }
 
 # ---------- Права администратора ----------
 # Нужны, чтобы видеть путь к клиенту игры (античит запускает его с повышенными правами)
 # и писать в папку zapret.
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and -not $TestUI) {
-    $extra = if ($RootOverride) { " -RootOverride `"$RootOverride`"" } else { '' }
+    $extra = ''
+    if ($RootOverride) { $extra += " -RootOverride `"$RootOverride`"" }
+    if ($Tray) { $extra += ' -Tray' }
     Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`"$extra"
     exit
 }
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
 
+# Один экземпляр. Повторный запуск (ярлык, батник) не ругается, а просит уже открытый показать окно.
 if (-not $TestUI) {
     $created = $false
     $script:Mutex = New-Object System.Threading.Mutex($true, 'Global\ZapretL2Helper', [ref]$created)
+    $script:ShowEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Global\ZapretL2HelperShow')
     if (-not $created) {
-        [System.Windows.MessageBox]::Show('L2 Helper уже запущен — окно должно быть на панели задач.', 'L2 Helper', 'OK', 'Information') | Out-Null
+        if (-not $Tray) { [void]$script:ShowEvent.Set() }
         exit
     }
 }
@@ -138,8 +146,9 @@ function Get-L2Info([int]$procId) {
     try {
         $p = [System.Diagnostics.Process]::GetProcessById($procId)
         $name = $p.ProcessName
-        $path = $null
-        try { $path = $p.MainModule.FileName } catch {}
+        # только «узнать путь» (PROCESS_QUERY_LIMITED_INFORMATION), как Диспетчер задач:
+        # Process.MainModule открывал игру с правом читать память — античиты такое не любят
+        $path = [L2hProc]::GetPath($procId)
         $isL2 = $false; $project = ''
         if ($path) {
             $dir = Split-Path $path -Parent
@@ -207,14 +216,29 @@ public static class L2hTcpTable {
         }
     }
 }
+public static class L2hProc {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool QueryFullProcessImageName(IntPtr h, int flags, System.Text.StringBuilder name, ref int size);
+    // 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION: ни памяти, ни потоков — только имя файла
+    public static string GetPath(int pid) {
+        IntPtr h = OpenProcess(0x1000, false, pid);
+        if (h == IntPtr.Zero) return null;
+        try {
+            var sb = new System.Text.StringBuilder(1024); int n = sb.Capacity;
+            return QueryFullProcessImageName(h, 0, sb, ref n) ? sb.ToString(0, n) : null;
+        } finally { CloseHandle(h); }
+    }
+}
 '@
-if (-not ('L2hTcpTable' -as [type])) { Add-Type -TypeDefinition $script:TcpSrc -Language CSharp }
+if (-not ('L2hProc' -as [type])) { Add-Type -TypeDefinition $script:TcpSrc -Language CSharp }
 
 # ---------- Окно ----------
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="L2 Helper" Width="760" Height="700" MinWidth="640" MinHeight="560"
+        Title="L2 Helper" Width="760" Height="820" MinWidth="640" MinHeight="680"
         Background="#0A0F0C" FontFamily="Segoe UI" WindowStartupLocation="CenterScreen">
   <Window.Resources>
     <SolidColorBrush x:Key="TextHi"    Color="#EAF2EC"/>
@@ -307,7 +331,7 @@ $xaml = @'
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
-      <RowDefinition Height="120"/>
+      <RowDefinition Height="100"/>
     </Grid.RowDefinitions>
 
     <StackPanel Grid.Row="0" Margin="0,0,0,16">
@@ -317,7 +341,7 @@ $xaml = @'
         <TextBlock x:Name="TxtVer" Foreground="{StaticResource TextLow}" FontSize="12" VerticalAlignment="Bottom" Margin="10,0,0,4"/>
       </StackPanel>
       <TextBlock Style="{StaticResource Muted}" Margin="0,6,0,0"
-                 Text="Lineage 2 вместе с zapret. Пока окно открыто, программа смотрит, к каким серверам подключается клиент Линейки — любого проекта — и убирает их из-под zapret. Связь с сервером перестаёт рваться, а YouTube, Discord и FACEIT работают как раньше."/>
+                 Text="Lineage 2 вместе с zapret. Пока программа работает (в окне или значком в трее), она смотрит, к каким серверам подключается клиент Линейки — любого проекта — и убирает их из-под zapret. Связь с сервером перестаёт рваться, а YouTube, Discord и FACEIT работают как раньше."/>
     </StackPanel>
 
     <Border Grid.Row="1" Style="{StaticResource Card}">
@@ -333,6 +357,11 @@ $xaml = @'
           <TextBlock x:Name="TxtZapret" FontSize="13.5"/>
         </StackPanel>
         <TextBlock x:Name="TxtRoot" Foreground="{StaticResource TextLow}" FontFamily="Consolas" FontSize="11.5" Margin="20,4,0,0" TextTrimming="CharacterEllipsis"/>
+        <CheckBox x:Name="ChkAuto" Margin="0,14,0,0" Foreground="{StaticResource TextHi}" FontSize="13.5" VerticalContentAlignment="Center"
+                  Content="Работать в фоне и запускаться вместе с Windows"
+                  ToolTip="После входа в Windows программа сама стартует в трее (значок у часов) и следит за игрой. Окно не открывается."/>
+        <TextBlock Foreground="{StaticResource TextLow}" FontSize="12" Margin="22,4,0,0" TextWrapping="Wrap"
+                   Text="Крестик прячет окно в трей у часов. Открыть — двойной щелчок по значку, выйти — правый щелчок → «Выход»."/>
       </StackPanel>
     </Border>
 
@@ -346,9 +375,9 @@ $xaml = @'
         <StackPanel Grid.Row="0">
           <TextBlock Text="С Е Р В Е Р Ы    В    И С К Л Ю Ч Е Н И Я Х" Style="{StaticResource Kicker}"/>
           <TextBlock Style="{StaticResource Muted}" FontSize="12.5" Margin="0,8,0,10"
-                     Text="Сохраняются насовсем — после перезагрузки искать заново не нужно, программу можно даже не запускать. Если самый первый вход оборвался — просто зайди ещё раз: сервер к этому моменту уже в списке."/>
+                     Text="Сохраняются насовсем — после перезагрузки искать заново не нужно. Если самый первый вход оборвался — просто зайди ещё раз: сервер к этому моменту уже в списке."/>
         </StackPanel>
-        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" MinHeight="90">
           <StackPanel x:Name="ServerList"/>
         </ScrollViewer>
         <Grid Grid.Row="2" Margin="0,12,0,0">
@@ -376,7 +405,7 @@ $xaml = @'
 
 $win = [Windows.Markup.XamlReader]::Parse($xaml)
 $ui = @{}
-foreach ($n in 'TxtVer','DotWatch','TxtWatch','TxtGame','DotZapret','TxtZapret','TxtRoot','ServerList','TxtAddIp','BtnAdd','BtnClear','TxtLog') {
+foreach ($n in 'TxtVer','DotWatch','TxtWatch','TxtGame','DotZapret','TxtZapret','TxtRoot','ChkAuto','ServerList','TxtAddIp','BtnAdd','BtnClear','TxtLog') {
     $ui[$n] = $win.FindName($n)
 }
 if ($TestUI) {
@@ -503,7 +532,7 @@ function Update-Status {
         $ui.TxtGame.Text = "Клиент запущен: $($g.name)" + $(if ($g.project) { " — $($g.project)" } else { '' }) + ". Новые серверы попадут в исключения сами."
         $ui.TxtGame.Foreground = $BrGreen
     } else {
-        $ui.TxtGame.Text = 'Клиент Линейки пока не запущен — запускай игру, окно можно не закрывать.'
+        $ui.TxtGame.Text = 'Клиент Линейки пока не запущен — запускай игру, программа следит и в трее.'
         $ui.TxtGame.Foreground = $BrMid
     }
 }
@@ -571,10 +600,114 @@ $statusTimer.Add_Tick({
     try { $n = Add-ToExcl @($script:Servers.Keys); if ($n) { Log "Вернул в список zapret серверов: $n"; Render-Servers } } catch {}
 })
 
+# ---------- Автозапуск ----------
+# Задача планировщика «при входе в Windows» с наивысшими правами: так программа стартует
+# без окна UAC при каждой загрузке. Ярлык в «Автозагрузке» так не умеет.
+$script:SelfPath = $PSCommandPath
+$script:SettingsFile = Join-Path $script:DataDir 'settings.json'
+function Get-Settings {
+    try { if (Test-Path $script:SettingsFile) { return ([IO.File]::ReadAllText($script:SettingsFile) | ConvertFrom-Json) } } catch {}
+    return $null
+}
+function Save-Settings([bool]$auto) {
+    [IO.File]::WriteAllText($script:SettingsFile, (ConvertTo-Json -InputObject ([ordered]@{ autostart = $auto })), (New-Object Text.UTF8Encoding $false))
+}
+function Get-TaskArgs { "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script:SelfPath`" -Tray" }
+function Get-AutostartTask { Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue }
+function Register-Autostart {
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $act = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument (Get-TaskArgs) -WorkingDirectory $script:AppDir
+    $trg = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $prn = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $script:TaskName -Action $act -Trigger $trg -Principal $prn -Settings $set -Description 'L2 Helper: следит за клиентом Lineage 2 и исключает его серверы из zapret' -Force | Out-Null
+}
+function Set-Autostart([bool]$on) {
+    try {
+        if ($on) { Register-Autostart } elseif (Get-AutostartTask) { Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false }
+        Save-Settings $on
+        return $true
+    } catch {
+        Log "ОШИБКА: не получилось $(if ($on) { 'включить' } else { 'выключить' }) автозапуск: $($_.Exception.Message)"
+        return $false
+    }
+}
+# Папку с программой могли перенести — задача должна смотреть на текущий файл
+function Sync-Autostart {
+    $t = Get-AutostartTask
+    $ok = $t -and (@($t.Actions)[0].Arguments -eq (Get-TaskArgs))
+    if (-not $ok) { if (Set-Autostart $true) { Log $(if ($t) { 'Автозапуск обновлён: программа лежит в новой папке' } else { 'Автозапуск включён: L2 Helper будет стартовать в трее вместе с Windows' }) } }
+}
+
+# ---------- Трей ----------
+function New-TrayIcon {
+    $bmp = New-Object System.Drawing.Bitmap 32, 32
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAliasGridFit'
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(52, 211, 153))), 1, 1, 30, 30)
+    $f = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+    $sf = New-Object System.Drawing.StringFormat; $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+    $g.DrawString('L2', $f, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(6, 18, 11))), (New-Object System.Drawing.RectangleF(0, 1, 32, 32)), $sf)
+    $g.Dispose()
+    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+}
+function Show-Main {
+    $win.Show()
+    if ($win.WindowState -eq 'Minimized') { $win.WindowState = 'Normal' }
+    [void]$win.Activate()
+}
+function Exit-App {
+    $script:Exiting = $true
+    $pollTimer.Stop(); $statusTimer.Stop()
+    if ($script:TrayIcon) { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() }
+    $win.Close()
+    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
+}
+
+$script:Exiting = $false
+$win.Add_Closing({ param($s, $e) if (-not $script:Exiting) { $e.Cancel = $true; $win.Hide() } })
+
+$script:AutoBusy = $false
+function Set-AutoUi([bool]$on) {
+    $script:AutoBusy = $true
+    try { $ui.ChkAuto.IsChecked = $on; if ($script:MenuAuto) { $script:MenuAuto.Checked = $on } } finally { $script:AutoBusy = $false }
+}
+function Toggle-Auto([bool]$on) {
+    if ($script:AutoBusy) { return }
+    if (Set-Autostart $on) { Log $(if ($on) { 'Автозапуск включён: L2 Helper будет стартовать в трее вместе с Windows' } else { 'Автозапуск выключен' }) }
+    Set-AutoUi ([bool](Get-AutostartTask))
+}
+$ui.ChkAuto.Add_Checked({ Toggle-Auto $true })
+$ui.ChkAuto.Add_Unchecked({ Toggle-Auto $false })
+
 if ($TestUI) { return }   # тестовый режим с L2H_TEST_KEEP: функции и окно загружены, таймеры не запущены
+
+# первый запуск — автозапуск включаем сразу (за этим программа и нужна); дальше слушаемся галочки
+$st = Get-Settings
+if (-not $st -or $st.autostart) { Sync-Autostart }
+Set-AutoUi ([bool](Get-AutostartTask))
+
+$script:TrayIcon = New-Object System.Windows.Forms.NotifyIcon
+$script:TrayIcon.Icon = New-TrayIcon
+$script:TrayIcon.Text = 'L2 Helper — Lineage 2 мимо zapret'
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+$mOpen = $menu.Items.Add('Открыть L2 Helper'); $mOpen.Font = New-Object System.Drawing.Font($mOpen.Font, [System.Drawing.FontStyle]::Bold)
+$mOpen.Add_Click({ Show-Main })
+$script:MenuAuto = New-Object System.Windows.Forms.ToolStripMenuItem 'Запускать вместе с Windows'
+$script:MenuAuto.Checked = [bool]$ui.ChkAuto.IsChecked
+$script:MenuAuto.Add_Click({ Toggle-Auto (-not $script:MenuAuto.Checked) })
+[void]$menu.Items.Add($script:MenuAuto)
+[void]$menu.Items.Add('-')
+$mExit = $menu.Items.Add('Выход'); $mExit.Add_Click({ Exit-App })
+$script:TrayIcon.ContextMenuStrip = $menu
+$script:TrayIcon.Add_MouseDoubleClick({ Show-Main })
+$script:TrayIcon.Visible = $true
+
+# повторный запуск батника/ярлыка просит показать окно
+$pollTimer.Add_Tick({ if ($script:ShowEvent -and $script:ShowEvent.WaitOne(0)) { Show-Main } })
 
 $pollTimer.Start()
 $statusTimer.Start()
-[void]$win.ShowDialog()
-$pollTimer.Stop(); $statusTimer.Stop()
+if (-not $Tray) { Show-Main }
+[System.Windows.Threading.Dispatcher]::Run()
 if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch {} }
