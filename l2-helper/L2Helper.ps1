@@ -7,6 +7,7 @@
 #  Исключения остаются в файле — после перезагрузки ничего искать не нужно.
 #  1.1: работа в трее, автозапуск с Windows (задача планировщика), процесс игры
 #       открывается только на «узнать путь» — без доступа к памяти (античит)
+#  1.2: кнопка «Проверить обновления» — сам качает L2-Helper.zip из релиза и обновляется
 # ============================================================
 param(
     [switch]$TestUI,
@@ -15,7 +16,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.1.0'
+$script:Version = '1.2.0'
+$script:UpdUrl = if ($env:L2H_UPD_URL) { $env:L2H_UPD_URL } else { 'https://github.com/MassimoUniverse/zapret-control/releases/latest/download/L2-Helper.zip' }
 $script:AppDir = if ($PSScriptRoot) { $PSScriptRoot } else { [AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
 $script:TaskName = if ($env:L2H_TASK_NAME) { $env:L2H_TASK_NAME } else { 'L2 Helper' }
 
@@ -335,11 +337,15 @@ $xaml = @'
     </Grid.RowDefinitions>
 
     <StackPanel Grid.Row="0" Margin="0,0,0,16">
-      <StackPanel Orientation="Horizontal">
-        <Ellipse Width="12" Height="12" Fill="{StaticResource GreenHi}" VerticalAlignment="Center" Margin="0,2,10,0"/>
-        <TextBlock Text="L2 Helper" FontSize="22" FontWeight="SemiBold"/>
-        <TextBlock x:Name="TxtVer" Foreground="{StaticResource TextLow}" FontSize="12" VerticalAlignment="Bottom" Margin="10,0,0,4"/>
-      </StackPanel>
+      <Grid>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <Ellipse Width="12" Height="12" Fill="{StaticResource GreenHi}" VerticalAlignment="Center" Margin="0,2,10,0"/>
+          <TextBlock Text="L2 Helper" FontSize="22" FontWeight="SemiBold"/>
+          <TextBlock x:Name="TxtVer" Foreground="{StaticResource TextLow}" FontSize="12" VerticalAlignment="Bottom" Margin="10,0,0,4"/>
+        </StackPanel>
+        <Button x:Name="BtnUpd" Content="Проверить обновления" HorizontalAlignment="Right" VerticalAlignment="Center" Padding="14,7"
+                ToolTip="Скачивает свежий L2 Helper из релиза на GitHub и обновляется сам. Найденные серверы и автозапуск сохраняются."/>
+      </Grid>
       <TextBlock Style="{StaticResource Muted}" Margin="0,6,0,0"
                  Text="Lineage 2 вместе с zapret. Пока программа работает (в окне или значком в трее), она смотрит, к каким серверам подключается клиент Линейки — любого проекта — и убирает их из-под zapret. Связь с сервером перестаёт рваться, а YouTube, Discord и FACEIT работают как раньше."/>
     </StackPanel>
@@ -405,7 +411,7 @@ $xaml = @'
 
 $win = [Windows.Markup.XamlReader]::Parse($xaml)
 $ui = @{}
-foreach ($n in 'TxtVer','DotWatch','TxtWatch','TxtGame','DotZapret','TxtZapret','TxtRoot','ChkAuto','ServerList','TxtAddIp','BtnAdd','BtnClear','TxtLog') {
+foreach ($n in 'TxtVer','DotWatch','TxtWatch','TxtGame','DotZapret','TxtZapret','TxtRoot','ChkAuto','ServerList','TxtAddIp','BtnAdd','BtnClear','TxtLog','BtnUpd') {
     $ui[$n] = $win.FindName($n)
 }
 if ($TestUI) {
@@ -680,6 +686,101 @@ function Toggle-Auto([bool]$on) {
 $ui.ChkAuto.Add_Checked({ Toggle-Auto $true })
 $ui.ChkAuto.Add_Unchecked({ Toggle-Auto $false })
 
+# ---------- Самообновление ----------
+# Берём тот же архив, что раздаётся людям: L2-Helper.zip из последнего релиза. Он маленький (~10 КБ),
+# поэтому версию узнаём, просто скачав его. Качаем в фоне, чтобы окно не подвисало.
+$script:UpdBody = {
+    param($url)
+    $tmp = Join-Path $env:TEMP ('l2h_upd_' + [Guid]::NewGuid().ToString('N'))
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $zip = Join-Path $tmp 'u.zip'
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 40
+        Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $tmp 'x') -Force
+        $ps1 = Get-ChildItem (Join-Path $tmp 'x') -Recurse -Filter 'L2Helper.ps1' | Select-Object -First 1
+        if (-not $ps1) { throw 'в архиве нет L2Helper.ps1' }
+        $bytes = [IO.File]::ReadAllBytes($ps1.FullName)
+        $text = [Text.Encoding]::UTF8.GetString($bytes)
+        $m = [regex]::Match($text, "\`$script:Version = '([0-9.]+)'")
+        if (-not $m.Success) { throw 'файл в архиве не похож на L2 Helper' }
+        $bat = Get-ChildItem (Join-Path $tmp 'x') -Recurse -Filter 'L2 Helper.bat' | Select-Object -First 1
+        @{ ok = $true; ver = $m.Groups[1].Value; ps1 = $bytes; bat = $(if ($bat) { [IO.File]::ReadAllBytes($bat.FullName) } else { $null }) }
+    } catch {
+        @{ ok = $false; err = $_.Exception.GetBaseException().Message }
+    } finally {
+        try { [IO.Directory]::Delete($tmp, $true) } catch {}
+    }
+}
+$script:UpdPs = $null; $script:UpdPending = $null
+function Set-UpdButton {
+    if ($script:UpdPs) { $ui.BtnUpd.Content = 'Проверяю...'; $ui.BtnUpd.IsEnabled = $false; return }
+    $ui.BtnUpd.IsEnabled = $true
+    if ($script:UpdPending) {
+        $ui.BtnUpd.Content = "Обновить до $($script:UpdPending.ver)"
+        $ui.BtnUpd.Background = BrushOf '#2FBF71'; $ui.BtnUpd.Foreground = BrushOf '#06120B'; $ui.BtnUpd.FontWeight = 'SemiBold'
+    } else {
+        $ui.BtnUpd.Content = 'Проверить обновления'
+        $ui.BtnUpd.ClearValue([System.Windows.Controls.Control]::BackgroundProperty)
+        $ui.BtnUpd.ClearValue([System.Windows.Controls.Control]::ForegroundProperty)
+        $ui.BtnUpd.ClearValue([System.Windows.Controls.Control]::FontWeightProperty)
+    }
+}
+function Start-UpdCheck([bool]$quiet) {
+    if ($script:UpdPs) { return }
+    $script:UpdQuiet = $quiet
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $script:UpdPs = [powershell]::Create(); $script:UpdPs.Runspace = $rs
+    [void]$script:UpdPs.AddScript($script:UpdBody).AddArgument($script:UpdUrl)
+    $script:UpdHandle = $script:UpdPs.BeginInvoke()
+    if (-not $quiet) { Log 'Проверяю обновления L2 Helper...' }
+    Set-UpdButton
+}
+function Poll-UpdCheck {
+    if (-not $script:UpdPs -or -not $script:UpdHandle.IsCompleted) { return }
+    $res = $null
+    try { $res = @($script:UpdPs.EndInvoke($script:UpdHandle))[-1] } catch { $res = @{ ok = $false; err = $_.Exception.Message } }
+    try { $script:UpdPs.Runspace.Close(); $script:UpdPs.Dispose() } catch {}
+    $script:UpdPs = $null
+    if (-not $res -or -not $res.ok) {
+        if (-not $script:UpdQuiet) { Log "Не удалось проверить обновления: $(if ($res) { $res.err } else { 'нет ответа' })" }
+    } elseif ([version]$res.ver -gt [version]$script:Version) {
+        $script:UpdPending = $res
+        Log "Доступна новая версия L2 Helper: $($res.ver) (у тебя $script:Version) — кнопка «Обновить» сверху справа"
+    } elseif (-not $script:UpdQuiet) {
+        Log "Обновлений нет: у тебя последняя версия ($script:Version)"
+    }
+    Set-UpdButton
+}
+function Install-Update {
+    $u = $script:UpdPending
+    $bytes = [byte[]]$u.ps1
+    $text = [Text.Encoding]::UTF8.GetString($bytes)
+    $errs = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count) { Log 'Скачанный файл повреждён — обновление отменено'; $script:UpdPending = $null; Set-UpdButton; return }
+    # PowerShell 5.1 читает файл без BOM как ANSI — русский текст сломается; BOM ставим, если его нет
+    if (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) { $bytes = [byte[]](@(0xEF, 0xBB, 0xBF) + $bytes) }
+    try {
+        Copy-Item -LiteralPath $script:SelfPath -Destination ($script:SelfPath + '.bak') -Force
+        [IO.File]::WriteAllBytes($script:SelfPath, $bytes)
+        if ($u.bat) { [IO.File]::WriteAllBytes((Join-Path (Split-Path $script:SelfPath -Parent) 'L2 Helper.bat'), [byte[]]$u.bat) }
+    } catch {
+        Log "ОШИБКА обновления: $($_.Exception.Message)"
+        return
+    }
+    Write-FileLog "обновлён до $($u.ver), перезапуск"
+    $script:RestartAfter = $true
+    Exit-App
+}
+$ui.BtnUpd.Add_Click({
+    if ($script:UpdPending) {
+        $r = [System.Windows.MessageBox]::Show("Обновить L2 Helper до версии $($script:UpdPending.ver)?`n`nПрограмма перезапустится сама. Найденные серверы и автозапуск сохранятся.", 'L2 Helper', 'YesNo', 'Question')
+        if ($r -eq 'Yes') { Install-Update }
+    } else {
+        Start-UpdCheck $false
+    }
+})
+
 if ($TestUI) { return }   # тестовый режим с L2H_TEST_KEEP: функции и окно загружены, таймеры не запущены
 
 # первый запуск — автозапуск включаем сразу (за этим программа и нужна); дальше слушаемся галочки
@@ -706,8 +807,20 @@ $script:TrayIcon.Visible = $true
 # повторный запуск батника/ярлыка просит показать окно
 $pollTimer.Add_Tick({ if ($script:ShowEvent -and $script:ShowEvent.WaitOne(0)) { Show-Main } })
 
+$pollTimer.Add_Tick({ Poll-UpdCheck })
+# тихая проверка обновлений: через 5 секунд после старта и дальше раз в 12 часов (в трее программа живёт днями)
+$updTimer = New-Object System.Windows.Threading.DispatcherTimer
+$updTimer.Interval = [TimeSpan]::FromSeconds(5)
+$updTimer.Add_Tick({ $updTimer.Interval = [TimeSpan]::FromHours(12); if (-not $script:UpdPending) { Start-UpdCheck $true } })
+$updTimer.Start()
+
 $pollTimer.Start()
 $statusTimer.Start()
 if (-not $Tray) { Show-Main }
 [System.Windows.Threading.Dispatcher]::Run()
+$updTimer.Stop()
 if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch {} }
+# после обновления — запускаем новую версию (мьютекс уже отпущен); права администратора наследуются
+if ($script:RestartAfter) {
+    try { Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script:SelfPath`"" } catch {}
+}
