@@ -14,6 +14,7 @@
 #  1.9: Линейка вынесена в отдельный L2 Helper (исключает IP серверов игры), из Control убрана
 #  1.9.1: служба не падает на стратегиях с ^ в .bat (general (FAKE TLS AUTO): fake-tls=^!)
 #  1.9.2: служба ждёт BFE при загрузке и сама перезапускается при сбое
+#  1.10: антидетект-браузеры (Octo, Dolphin, Linken Sphere, AdsPower и др.) всегда в обходе
 # ============================================================
 param(
     [switch]$TestParse,
@@ -22,7 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.9.2'
+$script:AppVersion = '1.10.0'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -135,6 +136,54 @@ function Apply-Customizations([string]$targetRoot) {
     return $changed
 }
 
+# ---------- Антидетект-браузеры ----------
+# Их сайты, API и синхронизация профилей стоят на Hetzner/OVH/Cloudflare, которые провайдеры режут по объёму
+# («грузится и висит»): так было с Octo — помогло добавить домены в обход. Теперь они в обходе всегда.
+# Держим их отдельным помеченным блоком в конце list-general-user.txt: строки пользователя не трогаем,
+# а блок пересобираем при каждом запуске (если кто-то его стёр — вернётся). winws перечитывает список сам.
+# zapret сравнивает домены по окончанию: adspower.net покрывает api.adspower.net и все поддомены.
+# MoreLogin НЕ добавлять: его провайдер не режет, а с обходом morelogin.com зависает (проверено, как с Twitch).
+$script:AntidetectDomains = [ordered]@{
+    'Octo Browser'  = @('octobrowser.net')
+    'Dolphin Anty'  = @('dolphin-anty.com', 'dolphin-anty-api.com', 'anty-api.com', 'dolphin.ru.com', 'dolphin.tech')
+    'Linken Sphere' = @('ls.app', 'linkensphere.com')
+    'AdsPower'      = @('adspower.net', 'adspower.com')
+    'Multilogin'    = @('multilogin.com', 'multiloginapp.com')
+    'GoLogin'       = @('gologin.com')
+    'Undetectable'  = @('undetectable.io')
+    'Vision'        = @('browser.vision')
+    'Incogniton'    = @('incogniton.com')
+    'Kameleo'       = @('kameleo.io')
+}
+$script:AdBlockBegin = '# >>> antidetect browsers (Zapret Control) >>>'
+$script:AdBlockEnd   = '# <<< antidetect browsers <<<'
+function Ensure-AntidetectDomains([string]$file) {
+    $lines = @()
+    if (Test-Path -LiteralPath $file) { $lines = @([IO.File]::ReadAllLines($file)) }
+    # всё, что вне нашего блока, — строки пользователя
+    $user = New-Object System.Collections.Generic.List[string]
+    $in = $false
+    foreach ($l in $lines) {
+        if ($l.Trim() -eq $script:AdBlockBegin) { $in = $true; continue }
+        if ($l.Trim() -eq $script:AdBlockEnd) { $in = $false; continue }
+        if (-not $in) { $user.Add($l) }
+    }
+    while ($user.Count -and -not $user[$user.Count - 1].Trim()) { $user.RemoveAt($user.Count - 1) }
+    $userDomains = @($user | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    $block = New-Object System.Collections.Generic.List[string]
+    $block.Add($script:AdBlockBegin)
+    foreach ($name in $script:AntidetectDomains.Keys) {
+        $d = @($script:AntidetectDomains[$name] | Where-Object { $userDomains -notcontains $_ })
+        if ($d.Count) { $block.Add("# $name"); foreach ($x in $d) { $block.Add($x) } }
+    }
+    $block.Add($script:AdBlockEnd)
+    $new = (@($user) + @($block)) -join "`r`n"
+    $old = $lines -join "`r`n"
+    if ($new -eq $old) { return $false }
+    [IO.File]::WriteAllText($file, $new + "`r`n", [Text.Encoding]::ASCII)
+    return $true
+}
+
 # Пользовательские списки + наши обязательные исключения (Twitch/OBS)
 function Ensure-DefaultLists([string]$targetRoot) {
     $l = Join-Path $targetRoot 'lists'
@@ -151,6 +200,7 @@ function Ensure-DefaultLists([string]$targetRoot) {
     $cur = Get-Content -LiteralPath $exclUser -ErrorAction SilentlyContinue
     $need = @('twitch.tv', 'ttvnw.net', 'jtvnw.net', 'live-video.net') | Where-Object { $cur -notcontains $_ }
     if ($need) { Add-Content -LiteralPath $exclUser -Value $need -Encoding ASCII }
+    [void](Ensure-AntidetectDomains $genUser)
 }
 
 # Куда ставить: рядом с приложением, но НИКОГДА не россыпью в корень диска
@@ -436,6 +486,7 @@ function Ensure-UserLists {
     if (-not (Test-Path $ipsetExcl)) { Set-Content -LiteralPath $ipsetExcl -Value '203.0.113.113/32' -Encoding ASCII }
     if (-not (Test-Path $genUser))   { Set-Content -LiteralPath $genUser -Value "# Never leave this file empty`r`ndomain.example.abc" -Encoding ASCII }
     if (-not (Test-Path $exclUser))  { Set-Content -LiteralPath $exclUser -Value 'domain.example.abc' -Encoding ASCII }
+    [void](Ensure-AntidetectDomains $genUser)
 }
 
 function Get-CurrentStrategy {
@@ -1556,8 +1607,12 @@ $xaml = @'
                       <TextBlock Text="list-general-user.txt" FontFamily="Consolas" FontSize="11.5" Foreground="{StaticResource TextMid}"/>
                     </Border>
                   </WrapPanel>
-                  <TextBlock Grid.Row="2" Style="{StaticResource Muted}" FontSize="12.5" Margin="0,0,0,14"
-                             Text="Домены, которые провайдер блокирует, а стокового списка не хватило. Файл не должен быть пустым."/>
+                  <StackPanel Grid.Row="2" Margin="0,0,0,12">
+                    <TextBlock Style="{StaticResource Muted}" FontSize="12.5"
+                               Text="Домены, которые провайдер блокирует, а стокового списка не хватило. Файл не должен быть пустым."/>
+                    <TextBlock Foreground="{StaticResource TextLow}" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap"
+                               Text="Антидетект-браузеры (Octo, Dolphin Anty, Linken Sphere, AdsPower и др.) в обходе всегда — их блок в конце списка приложение поддерживает само."/>
+                  </StackPanel>
                   <TextBox x:Name="TxtGeneral" Grid.Row="3" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
                            FontFamily="Consolas" FontSize="12.5"/>
                   <Button x:Name="BtnSaveGeneral" Grid.Row="4" Content="Сохранить" Style="{StaticResource Accent}"
