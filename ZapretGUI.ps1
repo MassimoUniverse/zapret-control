@@ -15,6 +15,7 @@
 #  1.9.1: служба не падает на стратегиях с ^ в .bat (general (FAKE TLS AUTO): fake-tls=^!)
 #  1.9.2: служба ждёт BFE при загрузке и сама перезапускается при сбое
 #  1.10: антидетект-браузеры (Octo, Dolphin, Linken Sphere, AdsPower и др.) всегда в обходе
+#  1.11: в том же блоке FACEIT (faceit.com, faceit-cdn.net) — для Беларуси и провайдеров, где его режут
 # ============================================================
 param(
     [switch]$TestParse,
@@ -23,7 +24,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.10.0'
+$script:AppVersion = '1.11.0'
 $script:SelfPath   = $PSCommandPath
 $script:AppRepoApi = 'https://api.github.com/repos/MassimoUniverse/zapret-control/releases/latest'
 $script:AppRepoUrl = 'https://github.com/MassimoUniverse/zapret-control'
@@ -154,9 +155,14 @@ $script:AntidetectDomains = [ordered]@{
     'Vision'        = @('browser.vision')
     'Incogniton'    = @('incogniton.com')
     'Kameleo'       = @('kameleo.io')
+    # FACEIT: сайт, клиент, античит и их обновления. Сама игра идёт через FACEIT MODE (любые IP).
+    # Добавлен для Беларуси и провайдеров, где FACEIT режут по домену; на Ростелекоме с обходом работает так же.
+    'FACEIT'        = @('faceit.com', 'faceit-cdn.net')
 }
-$script:AdBlockBegin = '# >>> antidetect browsers (Zapret Control) >>>'
-$script:AdBlockEnd   = '# <<< antidetect browsers <<<'
+$script:AdBlockBegin = '# >>> Zapret Control: services >>>'
+$script:AdBlockEnd   = '# <<< Zapret Control: services <<<'
+# заголовки блока из 1.10 — узнаём и заменяем новым, чтобы не осталось двух блоков
+$script:AdBlockOld = @('# >>> antidetect browsers (Zapret Control) >>>', '# <<< antidetect browsers <<<')
 function Ensure-AntidetectDomains([string]$file) {
     $lines = @()
     if (Test-Path -LiteralPath $file) { $lines = @([IO.File]::ReadAllLines($file)) }
@@ -164,8 +170,8 @@ function Ensure-AntidetectDomains([string]$file) {
     $user = New-Object System.Collections.Generic.List[string]
     $in = $false
     foreach ($l in $lines) {
-        if ($l.Trim() -eq $script:AdBlockBegin) { $in = $true; continue }
-        if ($l.Trim() -eq $script:AdBlockEnd) { $in = $false; continue }
+        if ($l.Trim() -eq $script:AdBlockBegin -or $l.Trim() -eq $script:AdBlockOld[0]) { $in = $true; continue }
+        if ($l.Trim() -eq $script:AdBlockEnd -or $l.Trim() -eq $script:AdBlockOld[1]) { $in = $false; continue }
         if (-not $in) { $user.Add($l) }
     }
     while ($user.Count -and -not $user[$user.Count - 1].Trim()) { $user.RemoveAt($user.Count - 1) }
@@ -1611,7 +1617,7 @@ $xaml = @'
                     <TextBlock Style="{StaticResource Muted}" FontSize="12.5"
                                Text="Домены, которые провайдер блокирует, а стокового списка не хватило. Файл не должен быть пустым."/>
                     <TextBlock Foreground="{StaticResource TextLow}" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap"
-                               Text="Антидетект-браузеры (Octo, Dolphin Anty, Linken Sphere, AdsPower и др.) в обходе всегда — их блок в конце списка приложение поддерживает само."/>
+                               Text="FACEIT и антидетект-браузеры (Octo, Dolphin Anty, Linken Sphere, AdsPower и др.) в обходе всегда — их блок в конце списка приложение поддерживает само."/>
                   </StackPanel>
                   <TextBox x:Name="TxtGeneral" Grid.Row="3" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
                            FontFamily="Consolas" FontSize="12.5"/>
